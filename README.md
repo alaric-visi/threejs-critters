@@ -101,3 +101,4 @@ python3 -m http.server 8000
 - **Orbit / Rotate**: Click and drag (or touch drag)
 - **Zoom** (`3d-models/`): Scroll wheel
 - **Auto-orbit**: Releases smoothly back into idle rotation
+
