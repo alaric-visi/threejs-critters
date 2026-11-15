@@ -1,4 +1,4 @@
-# threejs-critters
+# ThreeJs Critters
 
 A collection of 21 procedural 3D and wireframe biological/creature models built with **Three.js (`r128`)** as self-contained, zero-dependency HTML documents. Every specimen—from microscopic diatoms and tardigrades to articulated arthropods and a winged dragon—is synthesized entirely in code using parametric geometries, spline curves, vertex displacement, and procedural animation loops.
 
