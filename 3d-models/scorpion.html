@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ThreeJS: Scorpion 2</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #000; overflow: hidden; height: 100%; }
+  #bgCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 1; }
+  #animationCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 2; cursor: grab; touch-action: none; }
+  #animationCanvas:active { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="bgCanvas"></canvas>
+<canvas id="animationCanvas"></canvas>
+
+<script>
+const bgCanvas = document.getElementById('bgCanvas');
+const bgCtx = bgCanvas.getContext('2d');
+function initBackground(){
+  bgCanvas.width = innerWidth; bgCanvas.height = innerHeight;
+  bgCtx.fillStyle = '#000';
+  bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+}
+
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('animationCanvas'), antialias:true, alpha:true });
+let scene, camera, scorpion;
+const legParts = [];
+const tailJoints = [];
+const claws = [];      // { root, hand, movableFinger, side }
+const chelicerae = [];
+
+function updateSize(){
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+}
+
+const cam = { dist: 6, yaw: 0.6, pitch: 0.34, targetYaw: 0.6, targetPitch: 0.34, targetDist: 6, autoYaw: 0 };
+function updateCamera(){
+  const w = innerWidth;
+  if (w < 480) cam.targetDist = Math.min(Math.max(cam.targetDist, 6), 15);
+  camera.fov = w < 480 ? 58 : w < 768 ? 52 : 46;
+  camera.updateProjectionMatrix();
+}
+function applyCamera(){
+  cam.yaw   += (cam.targetYaw   - cam.yaw)   * 0.08;
+  cam.pitch += (cam.targetPitch - cam.pitch) * 0.08;
+  cam.dist  += (cam.targetDist  - cam.dist)  * 0.08;
+  const total = cam.yaw + cam.autoYaw;
+  const p = Math.max(-1.35, Math.min(1.35, cam.pitch));
+  camera.position.set(
+    Math.sin(total)*Math.cos(p)*cam.dist,
+    Math.sin(p)*cam.dist + 0.6,
+    Math.cos(total)*Math.cos(p)*cam.dist
+  );
+  camera.lookAt(0, 0.0, -0.2);
+}
+
+function chitin(color, opts={}){
+  return new THREE.MeshStandardMaterial(Object.assign({
+    color, roughness:0.42, metalness:0.28, side:THREE.DoubleSide
+  }, opts));
+}
+
+const iriMats = [];
+let hueShift = 0;
+function iri(offset, opts={}){
+  const { sat=0.85, light=0.52, roughness=0.30, metalness=0.55, opacity=1, transparent=false } = opts;
+  const m = new THREE.MeshStandardMaterial({
+    color:0xffffff, roughness, metalness, side:THREE.DoubleSide, transparent, opacity
+  });
+  m.userData = { offset, sat, light };
+  m.color.setHSL(((offset%1)+1)%1, sat, light);
+  iriMats.push(m);
+  return m;
+}
+
+function segmentBetween(p0, p1, r0, r1, material, radialSeg=10){
+  const dir = new THREE.Vector3().subVectors(p1, p0);
+  const len = dir.length();
+  const geo = new THREE.CylinderGeometry(r1, r0, len, radialSeg, 1, false);
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.position.copy(p0).add(p1).multiplyScalar(0.5);
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.clone().normalize());
+  return mesh;
+}
+
+// ---- Walking legs: like a spider's but held lower and wider ----
+function makeLeg(side, cfg){
+  const s = side;
+  const h = cfg.hue;
+  const femMat = iri(h,      { roughness:0.34, metalness:0.52 });
+  const tibMat = iri(h+0.06, { roughness:0.30, metalness:0.55, light:0.55 });
+  const darkMat= iri(h-0.04, { roughness:0.42, metalness:0.45, light:0.38 });
+  const hairMat= chitin(0x120a08, { roughness:0.65, metalness:0.08 });
+
+  const Lf = cfg.fem, Lt = cfg.tib;
+  const femLift = 0.42;
+  const patBend = 1.15;
+
+  const root = new THREE.Group();
+  root.position.set(s*cfg.hipX, cfg.hipY, cfg.hipZ);
+  root.rotation.y = cfg.yaw;
+
+  const coxaEnd = new THREE.Vector3(s*0.18, 0.0, 0);
+  root.add(segmentBetween(new THREE.Vector3(0,0,0), coxaEnd, 0.07, 0.058, darkMat, 8));
+
+  const femur = new THREE.Group();
+  femur.position.copy(coxaEnd);
+  femur.rotation.z = s*femLift;
+  root.add(femur);
+  const femEnd = new THREE.Vector3(s*Lf, 0, 0);
+  femur.add(segmentBetween(new THREE.Vector3(0,0,0), femEnd, 0.055, 0.040, femMat, 9));
+
+  const knee = new THREE.Group();
+  knee.position.copy(femEnd);
+  knee.rotation.z = -s*patBend;
+  femur.add(knee);
+  const tibEnd = new THREE.Vector3(s*Lt, 0, 0);
+  knee.add(segmentBetween(new THREE.Vector3(0,0,0), tibEnd, 0.038, 0.024, tibMat, 8));
+
+  // tarsus tip + claws
+  let prev = tibEnd.clone();
+  for (let k=0;k<3;k++){
+    const nt = prev.clone().add(new THREE.Vector3(s*0.08, -0.025 - k*0.007, 0));
+    knee.add(segmentBetween(prev, nt, 0.018 - k*0.004, 0.013 - k*0.004, darkMat, 6));
+    prev = nt;
+  }
+  [-1,1].forEach(cs=>{
+    const claw = prev.clone().add(new THREE.Vector3(s*0.04, -0.03, cs*0.02));
+    knee.add(segmentBetween(prev, claw, 0.009, 0.001, hairMat, 4));
+  });
+
+  // sparse bristles
+  for (let i=1;i<=4;i++){
+    const b = new THREE.Vector3().lerpVectors(new THREE.Vector3(0,0,0), tibEnd, i/5);
+    knee.add(segmentBetween(b, b.clone().add(new THREE.Vector3(0,-0.05,0.01*(i%2?1:-1))), 0.014, 0.001, hairMat, 3));
+  }
+
+  legParts.push({
+    root, femur, knee, side:s,
+    baseYaw:cfg.yaw, baseFemur:s*femLift, baseKnee:-s*patBend,
+    phase:cfg.phase, swing:cfg.swing
+  });
+  return root;
+}
+
+// ---- Pedipalps: the great pincers ----
+function makeClaw(side){
+  const s = side;
+  const armMat  = iri(s>0?0.05:0.10, { roughness:0.28, metalness:0.6, light:0.5 });
+  const handMat = iri(s>0?0.12:0.17, { roughness:0.22, metalness:0.7, light:0.52 });
+  const fingMat = iri(s>0?0.02:0.07, { roughness:0.25, metalness:0.6, light:0.42 });
+  const bumpMat = iri(0.9, { roughness:0.35, metalness:0.55, light:0.55 });
+
+  const root = new THREE.Group();
+  root.position.set(s*0.38, 0.12, 1.05);
+  root.rotation.y = s*-0.55;
+
+  // humerus + brachium: two stout arm segments reaching forward
+  const a1 = new THREE.Vector3(s*0.42, 0.06, 0.18);
+  root.add(segmentBetween(new THREE.Vector3(0,0,0), a1, 0.10, 0.085, armMat, 10));
+  const elbow = new THREE.Group();
+  elbow.position.copy(a1);
+  elbow.rotation.y = s*0.85;
+  root.add(elbow);
+  const a2 = new THREE.Vector3(s*0.14, 0.0, 0.48);
+  elbow.add(segmentBetween(new THREE.Vector3(0,0,0), a2, 0.085, 0.09, armMat, 10));
+
+  // chela: the bulky hand
+  const hand = new THREE.Group();
+  hand.position.copy(a2);
+  elbow.add(hand);
+  const palm = new THREE.Mesh(new THREE.SphereGeometry(0.30, 20, 16), handMat);
+  palm.scale.set(0.85, 0.55, 1.15);
+  palm.position.set(s*0.02, 0, 0.18);
+  hand.add(palm);
+  // granular bumps along the palm
+  for (let i=0;i<6;i++){
+    const b = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 6), bumpMat);
+    b.position.set(s*(0.16 - (i%2)*0.32)*0.8, 0.12, 0.02 + i*0.06);
+    hand.add(b);
+  }
+
+  // fixed finger: curves inward from the outer edge
+  const fixedCurve = new THREE.QuadraticBezierCurve3(
+    new THREE.Vector3(s*0.14, 0.02, 0.42),
+    new THREE.Vector3(s*0.10, 0.02, 0.78),
+    new THREE.Vector3(s*-0.06, 0.0, 0.92)
+  );
+  hand.add(new THREE.Mesh(new THREE.TubeGeometry(fixedCurve, 12, 0.045, 8, false), fingMat));
+  const ft = new THREE.Mesh(new THREE.SphereGeometry(0.045, 8, 8), fingMat);
+  ft.position.set(s*-0.06, 0, 0.92); hand.add(ft);
+
+  // movable finger: hinged at the inner edge, animated to snap
+  const movable = new THREE.Group();
+  movable.position.set(s*-0.12, 0.0, 0.34);
+  const movCurve = new THREE.QuadraticBezierCurve3(
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(s*0.02, 0.03, 0.34),
+    new THREE.Vector3(s*0.10, 0.0, 0.55)
+  );
+  movable.add(new THREE.Mesh(new THREE.TubeGeometry(movCurve, 12, 0.040, 8, false), fingMat));
+  const mt = new THREE.Mesh(new THREE.SphereGeometry(0.04, 8, 8), fingMat);
+  mt.position.set(s*0.10, 0, 0.55); movable.add(mt);
+  hand.add(movable);
+
+  claws.push({ root, elbow, hand, movable, side:s, baseYaw:s*-0.55 });
+  return root;
+}
+
+// ---- Metasoma: the tail, curling up and over, ending in the stinger ----
+function makeTail(){
+  const root = new THREE.Group();
+  root.position.set(0, 0.16, -1.55);
+  const nSeg = 5;
+  const segLens = [0.52, 0.50, 0.46, 0.42, 0.38];
+  const segRads = [0.17, 0.155, 0.14, 0.125, 0.11];
+  const baseCurl = [-0.30, -0.55, -0.62, -0.68, -0.72]; // negative x-rotation curls the tail up and over
+  let parent = root;
+  for (let i=0;i<nSeg;i++){
+    const j = new THREE.Group();
+    j.userData.base = baseCurl[i];
+    j.rotation.x = baseCurl[i];
+    const mat = iri(0.55 + i*0.08, { roughness:0.26, metalness:0.62, light:0.5 });
+    const end = new THREE.Vector3(0, 0, -segLens[i]);
+    j.add(segmentBetween(new THREE.Vector3(0,0,0), end, segRads[i], segRads[i]*0.88, mat, 12));
+    // dorsal keels: paired ridges of bumps
+    [-1,1].forEach(sx=>{
+      for (let k=0;k<3;k++){
+        const b = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 6), iri(0.6 + i*0.08, {light:0.6}));
+        b.position.set(sx*segRads[i]*0.75, segRads[i]*0.8, -segLens[i]*(k+0.5)/3);
+        j.add(b);
+      }
+    });
+    // joint ring
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(segRads[i]*0.95, segRads[i]*0.22, 6, 12), iri(0.5 + i*0.08, {light:0.4}));
+    ring.position.set(0,0,-segLens[i]);
+    j.add(ring);
+    parent.add(j);
+    const holder = new THREE.Group();
+    holder.position.set(0, 0, -segLens[i]);
+    j.add(holder);
+    parent = holder;
+    tailJoints.push(j);
+  }
+  // telson: venom bulb + curved aculeus (stinger)
+  const telson = new THREE.Group();
+  telson.rotation.x = -0.5;
+  tailJoints.push(telson);
+  telson.userData.base = -0.5;
+  const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.16, 16, 12), iri(0.92,{roughness:0.2,metalness:0.7,light:0.5}));
+  bulb.scale.set(0.9, 0.95, 1.3);
+  bulb.position.set(0, 0, -0.16);
+  telson.add(bulb);
+  const stingCurve = new THREE.QuadraticBezierCurve3(
+    new THREE.Vector3(0, 0.02, -0.30),
+    new THREE.Vector3(0, -0.06, -0.52),
+    new THREE.Vector3(0, -0.24, -0.58)
+  );
+  const sting = new THREE.Mesh(new THREE.TubeGeometry(stingCurve, 10, 0.045, 8, false), chitin(0x150b06,{roughness:0.18,metalness:0.55}));
+  telson.add(sting);
+  const tip = new THREE.Mesh(new THREE.ConeGeometry(0.045, 0.16, 8), chitin(0x150b06,{roughness:0.18,metalness:0.55}));
+  tip.position.set(0, -0.30, -0.59);
+  tip.rotation.x = Math.PI;
+  telson.add(tip);
+  parent.add(telson);
+  return root;
+}
+
+function createScorpion(){
+  const g = new THREE.Group();
+
+  // ---- Prosoma: front carapace ----
+  const carapace = new THREE.Mesh(new THREE.SphereGeometry(0.52, 26, 18), iri(0.08,{roughness:0.24,metalness:0.65,light:0.48}));
+  carapace.scale.set(1.0, 0.42, 1.1);
+  carapace.position.set(0, 0.22, 0.72);
+  g.add(carapace);
+
+  // median eyes on top, lateral eyes at the front corners
+  const eyeMat = chitin(0x0a0503, { roughness:0.12, metalness:0.65 });
+  [-1,1].forEach(sx=>{
+    const e = new THREE.Mesh(new THREE.SphereGeometry(0.05, 10, 10), eyeMat);
+    e.position.set(sx*0.07, 0.44, 0.70);
+    g.add(e);
+    for (let k=0;k<3;k++){
+      const le = new THREE.Mesh(new THREE.SphereGeometry(0.028, 8, 8), eyeMat);
+      le.position.set(sx*(0.30 + k*0.06), 0.32 - k*0.02, 1.16 - k*0.06);
+      g.add(le);
+    }
+  });
+
+  // small chelicerae at the very front
+  [-1,1].forEach(sx=>{
+    const ch = new THREE.Group();
+    ch.position.set(sx*0.08, 0.14, 1.28);
+    ch.add(segmentBetween(new THREE.Vector3(0,0,0), new THREE.Vector3(0,-0.06,0.12), 0.045, 0.03, iri(0.03,{light:0.4}), 6));
+    ch.add(segmentBetween(new THREE.Vector3(0,-0.06,0.12), new THREE.Vector3(sx*-0.02,-0.10,0.18), 0.02, 0.002, chitin(0x150b06), 4));
+    g.add(ch);
+    chelicerae.push({ root:ch, side:sx });
+  });
+
+  // ---- Mesosoma: seven broad armored plates ----
+  const nSeg = 7;
+  for (let i=0;i<nSeg;i++){
+    const t = i/(nSeg-1);
+    const w = 0.60 * (1 - t*0.28);
+    const seg = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 12), iri(0.22 + t*0.30, { light: i%2?0.52:0.44, metalness:0.6 }));
+    seg.scale.set(w, 0.20, 0.24);
+    seg.position.set(0, 0.16 - t*0.03, 0.28 - i*0.30);
+    g.add(seg);
+    const belly = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 10), iri(0.20 + t*0.30, { light:0.58, metalness:0.45 }));
+    belly.scale.set(w*0.88, 0.13, 0.21);
+    belly.position.set(0, 0.03 - t*0.03, 0.28 - i*0.30);
+    g.add(belly);
+    // lateral margin studs
+    if (i<nSeg-1) [-1,1].forEach(sx=>{
+      const b = new THREE.Mesh(new THREE.SphereGeometry(0.04, 8, 6), iri(0.3 + t*0.3,{light:0.62}));
+      b.position.set(sx*w*0.98, 0.14 - t*0.03, 0.28 - i*0.30);
+      g.add(b);
+    });
+  }
+
+  // ---- Tail and pincers ----
+  g.add(makeTail());
+  g.add(makeClaw( 1));
+  g.add(makeClaw(-1));
+
+  // ---- Eight walking legs ----
+  const legCfg = [
+    { hipX:0.42, hipY:0.02, hipZ:0.72, yaw:-0.85, fem:0.72, tib:0.80, swing:0.18, hue:0.00 },
+    { hipX:0.48, hipY:0.00, hipZ:0.42, yaw:-0.30, fem:0.80, tib:0.88, swing:0.20, hue:0.28 },
+    { hipX:0.48, hipY:0.00, hipZ:0.10, yaw: 0.35, fem:0.82, tib:0.90, swing:0.20, hue:0.58 },
+    { hipX:0.44, hipY:0.02, hipZ:-0.22, yaw: 0.90, fem:0.90, tib:1.00, swing:0.18, hue:0.82 },
+  ];
+  legCfg.forEach((c, i)=>{
+    const phR = (i%2===0) ? 0 : Math.PI;
+    g.add(makeLeg( 1, Object.assign({}, c, { phase:phR })));
+    g.add(makeLeg(-1, Object.assign({}, c, { yaw:-c.yaw, phase:phR + Math.PI })));
+  });
+
+  g.scale.setScalar(1.05);
+  g.position.y = 0.5;
+  return g;
+}
+
+function init(){
+  initBackground(); updateSize();
+
+  scene = new THREE.Scene();
+  scene.background = null;
+  scene.fog = new THREE.FogExp2(0x000000, 0.03);
+
+  camera = new THREE.PerspectiveCamera(46, innerWidth/innerHeight, 0.1, 1000);
+  updateCamera();
+
+  scorpion = createScorpion();
+  scene.add(scorpion);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x141020, 0.6));
+  const key = new THREE.DirectionalLight(0xffffff, 1.35); key.position.set(4,7,6); scene.add(key);
+  const rim = new THREE.PointLight(0x33ccff, 1.5, 60); rim.position.set(-6,3,-4); scene.add(rim);
+  const rim2 = new THREE.PointLight(0xff33aa, 1.3, 60); rim2.position.set(6,-2,-3); scene.add(rim2);
+  const under = new THREE.PointLight(0x8855ff, 0.7, 40); under.position.set(0,-5,3); scene.add(under);
+  const glint = new THREE.PointLight(0xffffff, 1.1, 40); glint.position.set(2,4,8); scene.add(glint);
+
+  addPointerControls();
+  animate();
+}
+
+let gaitSpeed = 0.7, gaitTarget = 0.7, nextBurst = 2;
+let strikeAmt = 0, strikeStart = -10, nextStrike = 4;
+let snapAmt = 0, snapStart = -10, nextSnap = 2.5;
+
+function animate(){
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const t = now * 0.001;
+
+  hueShift = (t * 0.05) % 1;
+  for (let i=0;i<iriMats.length;i++){
+    const m = iriMats[i];
+    m.color.setHSL((hueShift + m.userData.offset) % 1, m.userData.sat, m.userData.light);
+  }
+
+  // scuttle in bursts, then hold still and menace
+  if (t > nextBurst){
+    gaitTarget = Math.random() < 0.45 ? 0.05 : 1.8 + Math.random()*2.2;
+    nextBurst = t + 0.9 + Math.random()*2.4;
+  }
+  gaitSpeed += (gaitTarget - gaitSpeed) * 0.045;
+  const walk = (animate.wt = (animate.wt||0) + gaitSpeed * 0.05);
+
+  legParts.forEach(L=>{
+    const ph = walk + L.phase;
+    const swingLift = Math.max(0, Math.cos(ph));
+    const ease = swingLift * swingLift * (3 - 2*swingLift);
+    L.root.rotation.y  = L.baseYaw   + L.side * L.swing * Math.sin(ph);
+    L.femur.rotation.z = L.baseFemur + L.side * 0.24 * ease;
+    L.knee.rotation.z  = L.baseKnee  - L.side * 0.20 * ease;
+  });
+
+  // ---- Tail: sway, then a fast strike over the head every few seconds ----
+  if (t > nextStrike && strikeAmt < 0.01){
+    strikeStart = t;
+    nextStrike = t + 4 + Math.random()*5;
+  }
+  const st = t - strikeStart;
+  // envelope: fast whip forward (~0.18s), slower recovery (~0.9s)
+  strikeAmt = st < 0.18 ? st/0.18 : Math.max(0, 1 - (st-0.18)/0.9);
+  const strikeEase = strikeAmt*strikeAmt*(3-2*strikeAmt);
+  const sway = Math.sin(t*1.1)*0.05;
+  const swayY = Math.sin(t*0.7)*0.10;
+  for (let i=0;i<tailJoints.length;i++){
+    const j = tailJoints[i];
+    const tt = i/(tailJoints.length-1);
+    // the strike deepens the curl at the base and whips the tip forward-down
+    const strikeDelta = (i<2 ? -0.28 : -0.55 - tt*0.5);
+    j.rotation.x = j.userData.base + sway*(0.4+tt) + strikeDelta*strikeEase;
+    j.rotation.y = swayY * tt * (1 - strikeEase);
+  }
+
+  // ---- Pincers: slow guarding sway, with snapping fingers ----
+  if (t > nextSnap && snapAmt < 0.01){
+    snapStart = t;
+    nextSnap = t + 1.6 + Math.random()*3.5;
+  }
+  const sn = t - snapStart;
+  snapAmt = sn < 0.10 ? sn/0.10 : Math.max(0, 1 - (sn-0.10)/0.35);
+  claws.forEach(({root, elbow, movable, side})=>{
+    root.rotation.y = side*-0.55 + Math.sin(t*0.8 + side*1.6)*0.14 + strikeEase*side*0.18;
+    root.rotation.x = Math.sin(t*0.6 + side)*0.05 - strikeEase*0.12;
+    elbow.rotation.x = Math.sin(t*0.9 + side*2)*0.06;
+    // fingers hang slightly open, then clap shut on a snap
+    const open = 0.30 + Math.sin(t*0.9 + side)*0.08;
+    movable.rotation.y = side * -(open * (1 - snapAmt));
+  });
+
+  chelicerae.forEach(({root, side})=>{
+    root.rotation.x = Math.sin(t*5 + side*1.7)*0.08;
+  });
+
+  // body attitude: low scuttle, rearing up slightly during a strike
+  const busy = Math.min(1, gaitSpeed/2);
+  scorpion.position.y = 0.5 + Math.sin(walk*2)*0.03*busy + strikeEase*0.10;
+  scorpion.position.x = Math.sin(walk)*0.02*busy;
+  scorpion.rotation.z = Math.sin(walk*2)*0.015*busy;
+  scorpion.rotation.x = Math.sin(t*0.9)*0.015 - strikeEase*0.08;
+
+  if (!dragging) cam.autoYaw += 0.0016 + gaitSpeed*0.00025;
+  applyCamera();
+
+  renderer.render(scene, camera);
+}
+
+let dragging=false, lastX=0, lastY=0, pinchD=0;
+function addPointerControls(){
+  const c = renderer.domElement;
+  c.addEventListener('pointerdown', e=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; c.setPointerCapture(e.pointerId); });
+  c.addEventListener('pointermove', e=>{
+    if(!dragging) return;
+    cam.targetYaw   += (e.clientX-lastX)*0.006;
+    cam.targetPitch += (e.clientY-lastY)*0.006;
+    lastX=e.clientX; lastY=e.clientY;
+  });
+  const stop=()=>dragging=false;
+  c.addEventListener('pointerup', stop);
+  c.addEventListener('pointercancel', stop);
+  c.addEventListener('pointerleave', stop);
+  c.addEventListener('wheel', e=>{ e.preventDefault(); cam.targetDist = Math.max(5.5, Math.min(18, cam.targetDist + e.deltaY*0.01)); }, {passive:false});
+  c.addEventListener('touchmove', e=>{
+    if(e.touches.length===2){
+      const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY;
+      const d=Math.hypot(dx,dy);
+      if(pinchD) cam.targetDist = Math.max(5.5, Math.min(18, cam.targetDist + (pinchD-d)*0.02));
+      pinchD=d;
+    }
+  }, {passive:true});
+  c.addEventListener('touchend', ()=>pinchD=0);
+}
+
+addEventListener('resize', ()=>{
+  updateSize();
+  initBackground();
+  if(camera){ camera.aspect = innerWidth/innerHeight; updateCamera(); }
+});
+addEventListener('load', init);
+</script>
+</body>
+</html>

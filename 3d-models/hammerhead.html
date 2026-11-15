@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ThreeJS: Hammerhead Worm</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #000; overflow: hidden; height: 100%; }
+  #bgCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 1; }
+  #animationCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 2; cursor: grab; touch-action: none; }
+  #animationCanvas:active { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="bgCanvas"></canvas>
+<canvas id="animationCanvas"></canvas>
+
+<script>
+const bgCanvas = document.getElementById('bgCanvas');
+const bgCtx = bgCanvas.getContext('2d');
+function initBackground(){
+  bgCanvas.width = innerWidth; bgCanvas.height = innerHeight;
+  bgCtx.fillStyle = '#000';
+  bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+}
+
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('animationCanvas'), antialias:true, alpha:true });
+let scene, camera, worm;
+const bodySegs = [];  // { grp, u, z } - each segment group follows the spine in animate()
+let headFan = null;
+
+function updateSize(){
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+}
+
+const cam = { dist: 4.4, yaw: 0.6, pitch: 0.34, targetYaw: 0.6, targetPitch: 0.34, targetDist: 4.4, autoYaw: 0 };
+function updateCamera(){
+  const w = innerWidth;
+  if (w < 480){ cam.targetDist = Math.min(Math.max(cam.targetDist, 8.5), 13); camera.fov = 58; }
+  else if (w < 768){ camera.fov = 52; }
+  else { camera.fov = 46; }
+  camera.updateProjectionMatrix();
+}
+function applyCamera(){
+  cam.yaw   += (cam.targetYaw   - cam.yaw)   * 0.08;
+  cam.pitch += (cam.targetPitch - cam.pitch) * 0.08;
+  cam.dist  += (cam.targetDist  - cam.dist)  * 0.08;
+  const total = cam.yaw + cam.autoYaw;
+  const p = Math.max(-1.35, Math.min(1.35, cam.pitch));
+  camera.position.set(
+    Math.sin(total)*Math.cos(p)*cam.dist,
+    Math.sin(p)*cam.dist + 0.3,
+    Math.cos(total)*Math.cos(p)*cam.dist
+  );
+  camera.lookAt(0, -0.05, 0.0);
+}
+
+function matte(color, opts={}){
+  return new THREE.MeshStandardMaterial(Object.assign({
+    color, roughness:0.55, metalness:0.12, side:THREE.DoubleSide
+  }, opts));
+}
+
+// Iridescent rainbow materials: hue cycles over time, offset per part,
+// so colour bands travel along the body (same system as the tardigrade).
+const iriMats = [];
+let hueShift = 0;
+function iri(offset, opts={}){
+  const { sat=0.8, light=0.52, roughness=0.3, metalness=0.25 } = opts;
+  const m = new THREE.MeshStandardMaterial({
+    color:0xffffff, roughness, metalness, side:THREE.DoubleSide
+  });
+  m.userData = { offset, sat, light };
+  m.color.setHSL(((offset%1)+1)%1, sat, light);
+  iriMats.push(m);
+  return m;
+}
+
+function fuzz(geo, amp, freq){
+  const pos = geo.attributes.position, v = new THREE.Vector3();
+  for (let i=0;i<pos.count;i++){
+    v.fromBufferAttribute(pos, i);
+    const n = (Math.sin(v.x*freq)*Math.cos(v.y*freq*1.3) + Math.sin(v.z*freq*1.7))*0.5;
+    const d = 1 + amp*n + amp*0.4*(Math.random()-0.5);
+    v.multiplyScalar(d);
+    pos.setXYZ(i, v.x, v.y, v.z);
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+}
+
+// ---- Hammerhead worm ----
+// A land planarian rendered in the iridescent style: a thick rounded ribbon
+// with a dark dorsal stripe, a broad crescent head fan fringed with
+// eyespots, and rainbow hues sweeping down its length.
+
+const WORM = { zHead: 1.55, zTail: -1.85 };
+
+function widthAt(u){
+  const neck = 1 - 0.22*Math.exp(-Math.pow((u-0.04)/0.05, 2));
+  const tail = Math.max(0.04, 1 - Math.pow(Math.max(0, (u-0.60)/0.40), 1.5));
+  return 0.15 * neck * tail;
+}
+
+function createWorm(){
+  const g = new THREE.Group();
+  const span = WORM.zHead - WORM.zTail;
+
+  const stripeMat  = matte(0x1c1008, { roughness:0.35, metalness:0.15 });
+  const eyespotMat = matte(0x120a04, { roughness:0.4 });
+
+  // Body: overlapping segments with a genuinely rounded cross-section -
+  // clearly thicker than the flat ribbon it replaced - each in its own
+  // group so the spine solver can pose them every frame. Depth is floored
+  // at the spacing so the body always stays one connected piece.
+  const N = 45;
+  const dz = span/(N-1);
+  for (let i=0;i<N;i++){
+    const u = i/(N-1);
+    const z = WORM.zHead - u*span;
+    const w = widthAt(u);
+    const grp = new THREE.Group();
+    grp.position.set(0, 0, z);
+    g.add(grp);
+
+    const mat = iri(0.02 + u*0.9, { light: 0.5 + 0.06*Math.sin(u*22), sat:0.85 });
+    const geo = new THREE.SphereGeometry(1, 20, 16);
+    fuzz(geo, 0.012, 7);
+    const seg = new THREE.Mesh(geo, mat);
+    // Thick rounded cross-section: still wider than tall, but with real depth
+    const wide = w*1.35, tall = w*0.85, depth = Math.max(dz*0.9, w*0.9);
+    seg.scale.set(wide, tall, depth);
+    grp.add(seg);
+
+    // Pale iridescent sole underneath
+    const sole = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8), iri(0.02 + u*0.9, { light:0.72, sat:0.4 }));
+    sole.scale.set(wide*0.78, tall*0.45, depth*0.92);
+    sole.position.y = -tall*0.55;
+    grp.add(sole);
+
+    // Dark dorsal stripe riding the crest of the body
+    if (u > 0.015){
+      const st = new THREE.Mesh(new THREE.SphereGeometry(1, 10, 6), stripeMat);
+      st.scale.set(w*0.22, tall*0.32, depth*1.02);
+      st.position.set(0, tall*0.72, 0);
+      grp.add(st);
+    }
+
+    bodySegs.push({ grp, u, z });
+  }
+
+  // Head fan: thick crescent of lobes attached to the first segment so it
+  // leads the spine. Lobes have real vertical depth to match the fatter body.
+  const headGrp = bodySegs[0].grp;
+  const fan = new THREE.Group();
+  fan.position.set(0, 0.01, 0.10);
+  headGrp.add(fan);
+
+  const lobes = [
+    { x: 0,     z: 0.10,   sx: 0.30,  sz: 0.16 , ry: 0 },
+    { x: -0.26, z: 0.015,  sx: 0.20,  sz: 0.115, ry:  0.55 },
+    { x:  0.26, z: 0.015,  sx: 0.20,  sz: 0.115, ry: -0.55 },
+    { x: -0.40, z: -0.075, sx: 0.115, sz: 0.075, ry:  0.95 },
+    { x:  0.40, z: -0.075, sx: 0.115, sz: 0.075, ry: -0.95 }
+  ];
+  lobes.forEach((L,i)=>{
+    const m = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12),
+                             iri(0.02 + Math.abs(L.x)*0.25, { light:0.56, sat:0.8 }));
+    m.scale.set(L.sx, 0.065, L.sz);
+    m.position.set(L.x, 0, L.z);
+    m.rotation.y = L.ry;
+    fan.add(m);
+  });
+
+  // Central stripe running onto the back of the fan, then stopping
+  const fanStripe = new THREE.Mesh(new THREE.SphereGeometry(1, 10, 6), stripeMat);
+  fanStripe.scale.set(0.035, 0.028, 0.10);
+  fanStripe.position.set(0, 0.05, -0.04);
+  fan.add(fanStripe);
+
+  // Eyespot fringe along the fan's leading edge
+  const nSpots = 22;
+  for (let i=0;i<nSpots;i++){
+    const f = i/(nSpots-1);
+    const a = (f-0.5)*2.4;
+    const rx = 0.46*Math.sin(a);
+    const rz = 0.20*Math.cos(a) + 0.02 - 0.16*Math.abs(f-0.5);
+    const spot = new THREE.Mesh(new THREE.SphereGeometry(0.009, 5, 5), eyespotMat);
+    spot.position.set(rx, 0.03, rz + 0.06);
+    fan.add(spot);
+  }
+
+  headFan = fan;
+
+  // Glistening beads along the back
+  for (let i=0;i<26;i++){
+    const u = 0.05 + Math.random()*0.9;
+    const idx = Math.min(N-1, Math.round(u*(N-1)));
+    const w = widthAt(u);
+    const bead = new THREE.Mesh(new THREE.SphereGeometry(0.006 + Math.random()*0.005, 5, 5),
+                                matte(0xffffff, { roughness:0.1, metalness:0.3, transparent:true, opacity:0.45 }));
+    bead.position.set((Math.random()-0.5)*w*1.2, w*0.85*0.8, (Math.random()-0.5)*0.05);
+    bodySegs[idx].grp.add(bead);
+  }
+
+  g.position.y = -0.15;
+  g.scale.setScalar(1.15);
+  return g;
+}
+
+function init(){
+  initBackground(); updateSize();
+
+  scene = new THREE.Scene();
+  scene.background = null;
+  scene.fog = new THREE.FogExp2(0x000000, 0.026);
+
+  camera = new THREE.PerspectiveCamera(46, innerWidth/innerHeight, 0.1, 1000);
+  updateCamera();
+
+  worm = createWorm();
+  scene.add(worm);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x141020, 0.65));
+  const key  = new THREE.DirectionalLight(0xffffff, 1.3); key.position.set(4,7,6); scene.add(key);
+  const rim  = new THREE.PointLight(0x33ccff, 1.3, 60); rim.position.set(-6,3,-4); scene.add(rim);
+  const rim2 = new THREE.PointLight(0xff33aa, 1.1, 60); rim2.position.set(6,-2,-3); scene.add(rim2);
+  const under= new THREE.PointLight(0x8855ff, 0.5, 40); under.position.set(0,-5,3); scene.add(under);
+  const glint= new THREE.PointLight(0xffffff, 0.9, 40); glint.position.set(2,4,8); scene.add(glint);
+
+  addPointerControls();
+  animate();
+}
+
+// ---- Spine solver ----
+// Instead of each segment waving independently (which shears and looks
+// mechanical), we compute a smooth centreline every frame from layered
+// travelling waves, then pose each segment ON that curve, oriented along
+// its local tangent and banked into the bends. The result is one coherent
+// body flowing head-to-tail.
+function spineX(u, t, glide){
+  const env = 0.22 + 0.78*u;                                  // head steady, tail free
+  const primary   = Math.sin(u*4.4 - t*(0.9 + glide*1.2));    // main glide wave
+  const secondary = Math.sin(u*8.2 - t*(1.5 + glide*1.6) + 1.7)*0.22;
+  const meander   = Math.sin(u*1.4 - t*0.18)*0.55;            // slow whole-body curve
+  const amp = 0.045 + glide*0.15;
+  return (primary + secondary)*amp*env + meander*amp;
+}
+function spineY(u, t, glide){
+  // Faint dorsoventral ripple - much smaller than the lateral wave, as in
+  // real ciliary gliding, and a slight head lift when slow (searching)
+  return Math.sin(u*6.0 - t*1.1)*0.008*glide;
+}
+
+let glideSpeed = 0.6, glideTarget = 0.6, nextChange = 3;
+function animate(){
+  requestAnimationFrame(animate);
+  const t = performance.now() * 0.001;
+
+  // Rainbow cycle: hue bands sweep along the body
+  hueShift = (t * 0.05) % 1;
+  for (let i=0;i<iriMats.length;i++){
+    const m = iriMats[i];
+    m.color.setHSL((hueShift + m.userData.offset) % 1, m.userData.sat, m.userData.light);
+  }
+
+  if (t > nextChange){
+    glideTarget = Math.random() < 0.3 ? 0.10 : 0.5 + Math.random()*0.6;
+    nextChange = t + 3.0 + Math.random()*4.0;
+  }
+  glideSpeed += (glideTarget - glideSpeed) * 0.012;
+
+  // Pose every segment on the spine curve
+  const eps = 0.01;
+  for (let i=0;i<bodySegs.length;i++){
+    const sd = bodySegs[i];
+    const u = sd.u;
+    const x = spineX(u, t, glideSpeed);
+    const y = spineY(u, t, glideSpeed);
+    sd.grp.position.x = x;
+    sd.grp.position.y = y;
+
+    // Tangent via finite difference along the curve -> yaw follows the bend
+    const x2 = spineX(Math.min(1, u+eps), t, glideSpeed);
+    const slope = (x2 - x) / (eps * (WORM.zHead - WORM.zTail));
+    sd.grp.rotation.y = Math.atan(slope * (WORM.zHead - WORM.zTail) * 0.28);
+    // Bank gently into curves, like soft tissue leaning through a turn
+    sd.grp.rotation.z = -slope*0.35;
+
+    // Peristaltic thickness wave - subtle, travelling tailward
+    const squish = 1 + Math.sin(t*1.5 - u*5.5)*0.035;
+    sd.grp.scale.set(2-squish*0.98, squish, 1);
+  }
+
+  // Head fan: sweeps side-to-side when the worm slows to search,
+  // stays level and forward when gliding fast
+  if (headFan){
+    const search = Math.max(0, 1.1 - glideSpeed);
+    headFan.rotation.y = Math.sin(t*0.8)*0.30*search + Math.sin(t*2.1)*0.04;
+    headFan.rotation.x = -Math.max(0, Math.sin(t*0.45))*0.18*search;
+    headFan.position.y = 0.01 + Math.max(0, Math.sin(t*0.45))*0.05*search;
+  }
+
+  // Whole-body drift: slow meander, no bobbing (a glider hugs its path)
+  worm.position.x = Math.sin(t*0.10)*0.25*glideSpeed;
+  worm.position.z = Math.sin(t*0.13)*0.20*glideSpeed;
+  worm.rotation.y = Math.sin(t*0.07)*0.30;
+
+  if (!dragging) cam.autoYaw += 0.0010 + glideSpeed*0.0003;
+  applyCamera();
+
+  renderer.render(scene, camera);
+}
+
+let dragging=false, lastX=0, lastY=0, pinchD=0;
+function addPointerControls(){
+  const c = renderer.domElement;
+  c.addEventListener('pointerdown', e=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; c.setPointerCapture(e.pointerId); });
+  c.addEventListener('pointermove', e=>{
+    if(!dragging) return;
+    cam.targetYaw   += (e.clientX-lastX)*0.006;
+    cam.targetPitch += (e.clientY-lastY)*0.006;
+    lastX=e.clientX; lastY=e.clientY;
+  });
+  const stop=()=>dragging=false;
+  c.addEventListener('pointerup', stop);
+  c.addEventListener('pointercancel', stop);
+  c.addEventListener('pointerleave', stop);
+  c.addEventListener('wheel', e=>{ e.preventDefault(); cam.targetDist = Math.max(4, Math.min(15, cam.targetDist + e.deltaY*0.01)); }, {passive:false});
+  c.addEventListener('touchmove', e=>{
+    if(e.touches.length===2){
+      const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY;
+      const d=Math.hypot(dx,dy);
+      if(pinchD) cam.targetDist = Math.max(4, Math.min(15, cam.targetDist + (pinchD-d)*0.02));
+      pinchD=d;
+    }
+  }, {passive:true});
+  c.addEventListener('touchend', ()=>pinchD=0);
+}
+
+addEventListener('resize', ()=>{
+  updateSize();
+  initBackground();
+  if(camera){ camera.aspect = innerWidth/innerHeight; updateCamera(); }
+});
+addEventListener('load', init);
+</script>
+</body>
+</html>

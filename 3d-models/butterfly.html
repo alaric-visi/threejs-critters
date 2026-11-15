@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ThreeJS: Butterfly 2</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #000; overflow: hidden; height: 100%; }
+  #bgCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 1; }
+  #animationCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 2; cursor: grab; touch-action: none; }
+  #animationCanvas:active { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="bgCanvas"></canvas>
+<canvas id="animationCanvas"></canvas>
+
+<script>
+const bgCanvas = document.getElementById('bgCanvas');
+const bgCtx = bgCanvas.getContext('2d');
+function initBackground(){
+  bgCanvas.width = innerWidth; bgCanvas.height = innerHeight;
+  bgCtx.fillStyle = '#000';
+  bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+}
+
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('animationCanvas'), antialias:true, alpha:true });
+let scene, camera, butterfly;
+const foreWings = [];   // { pivot, side }
+const hindWings = [];
+const antennaJoints = [];
+const legGroups = [];
+let abdomen = null, proboscis = null;
+
+function updateSize(){
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+}
+
+const cam = { dist: 6, yaw: 0.5, pitch: 0.30, targetYaw: 0.5, targetPitch: 0.30, targetDist: 6, autoYaw: 0 };
+function updateCamera(){
+  const w = innerWidth;
+  if (w < 480) cam.targetDist = Math.min(Math.max(cam.targetDist, 6), 14);
+  camera.fov = w < 480 ? 58 : w < 768 ? 52 : 46;
+  camera.updateProjectionMatrix();
+}
+function applyCamera(){
+  cam.yaw   += (cam.targetYaw   - cam.yaw)   * 0.08;
+  cam.pitch += (cam.targetPitch - cam.pitch) * 0.08;
+  cam.dist  += (cam.targetDist  - cam.dist)  * 0.08;
+  const total = cam.yaw + cam.autoYaw;
+  const p = Math.max(-1.35, Math.min(1.35, cam.pitch));
+  camera.position.set(
+    Math.sin(total)*Math.cos(p)*cam.dist,
+    Math.sin(p)*cam.dist + 0.4,
+    Math.cos(total)*Math.cos(p)*cam.dist
+  );
+  camera.lookAt(0, 0.1, 0);
+}
+
+function chitin(color, opts={}){
+  return new THREE.MeshStandardMaterial(Object.assign({
+    color, roughness:0.42, metalness:0.28, side:THREE.DoubleSide
+  }, opts));
+}
+
+const iriMats = [];
+let hueShift = 0;
+function iri(offset, opts={}){
+  const { sat=0.85, light=0.52, roughness=0.30, metalness=0.55, opacity=1, transparent=false } = opts;
+  const m = new THREE.MeshStandardMaterial({
+    color:0xffffff, roughness, metalness, side:THREE.DoubleSide, transparent, opacity
+  });
+  m.userData = { offset, sat, light };
+  m.color.setHSL(((offset%1)+1)%1, sat, light);
+  iriMats.push(m);
+  return m;
+}
+
+function segmentBetween(p0, p1, r0, r1, material, radialSeg=10){
+  const dir = new THREE.Vector3().subVectors(p1, p0);
+  const len = dir.length();
+  const geo = new THREE.CylinderGeometry(r1, r0, len, radialSeg, 1, false);
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.position.copy(p0).add(p1).multiplyScalar(0.5);
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.clone().normalize());
+  return mesh;
+}
+
+// A flat disc lying on the wing surface, for spots and eyespots
+function wingSpot(x, y, r, material){
+  const spot = new THREE.Mesh(new THREE.CylinderGeometry(r, r, 0.012, 20), material);
+  spot.rotation.x = Math.PI/2;          // flat against the extruded shape's XY plane
+  spot.position.set(x, y, 0.06);
+  return spot;
+}
+
+// ---- Wings ----
+// Shapes are built in the XY plane (x = outward span, y = fore/aft),
+// then rotated -PI/2 about X so they lie flat; the pivot flaps about Z.
+//
+// SYMMETRY NOTE: the left wing must be a true MIRROR of the right one.
+// Placing the same shape with pivot.rotation.y = PI only rotates it 180
+// degrees in-plane, which flips the leading and trailing edges: the left
+// forewing's leading edge pointed backwards into the hindwing (wings
+// crossing), and the left hindwing's swallowtail streamer pointed forwards
+// (asymmetric back wings). Mirroring the shape fore/aft with scale.y = -1
+// before that rotation produces an exact reflection, and the same flap
+// angle then drives both sides symmetrically.
+function makeForewing(side){
+  const len = 2.6, wid = 1.5;
+  const shape = new THREE.Shape();
+  shape.moveTo(0, 0.10);
+  shape.bezierCurveTo(len*0.30, wid*0.55, len*0.72, wid*0.62, len*0.98, wid*0.34);  // leading edge out to the apex
+  shape.bezierCurveTo(len*1.02, wid*0.22, len*0.96, wid*0.02, len*0.86, -wid*0.10); // outer margin
+  shape.bezierCurveTo(len*0.62, -wid*0.30, len*0.28, -wid*0.34, 0.02, -wid*0.16);   // trailing edge back to the body
+  shape.lineTo(0, 0.10);
+  const geo = new THREE.ExtrudeGeometry(shape, { depth:0.035, bevelEnabled:true, bevelThickness:0.015, bevelSize:0.015, bevelSegments:2, steps:1, curveSegments:28 });
+  const mat = iri(side>0 ? 0.02 : 0.08, { roughness:0.20, metalness:0.75, light:0.52, opacity:0.96, transparent:true });
+  const wing = new THREE.Mesh(geo, mat);
+
+  // dark scalloped border: slightly larger dusky wing behind
+  const border = new THREE.Mesh(geo, chitin(0x120818, { roughness:0.5, metalness:0.3 }));
+  border.scale.set(1.055, 1.075, 0.6);
+  border.position.set(-0.02, -0.02, 0.008);
+  wing.add(border);
+
+  // eyespot near the apex: concentric discs
+  wing.add(wingSpot(len*0.74, wid*0.26, 0.20, chitin(0x0d0612,{roughness:0.4})));
+  wing.add(wingSpot(len*0.74, wid*0.26, 0.13, iri(0.62,{light:0.55,metalness:0.7})));
+  wing.add(wingSpot(len*0.74, wid*0.26, 0.055, chitin(0xffffff,{roughness:0.25,metalness:0.4})));
+  // scattered smaller spots
+  wing.add(wingSpot(len*0.50, -wid*0.08, 0.09, iri(0.45,{light:0.6})));
+  wing.add(wingSpot(len*0.32,  wid*0.22, 0.07, iri(0.35,{light:0.62})));
+  wing.add(wingSpot(len*0.60,  wid*0.42, 0.06, iri(0.30,{light:0.6})));
+
+  // veins fanning from the root
+  for (let vi=0; vi<6; vi++){
+    const f = vi/5;
+    const veinMat = iri(0.12 + f*0.25, { roughness:0.32, metalness:0.6, light:0.6 });
+    const vc = new THREE.QuadraticBezierCurve3(
+      new THREE.Vector3(0.04, 0, 0.05),
+      new THREE.Vector3(len*0.5, (f-0.35)*wid*0.85, 0.05),
+      new THREE.Vector3(len*(0.82 + f*0.14), (f-0.4)*wid*0.75, 0.05)
+    );
+    wing.add(new THREE.Mesh(new THREE.TubeGeometry(vc, 12, 0.011, 4, false), veinMat));
+  }
+
+  const pivot = new THREE.Group();
+  wing.rotation.x = -Math.PI/2;
+  if (side < 0) wing.scale.y = -1;   // true mirror for the left wing (spots and veins mirror with it)
+  pivot.add(wing);
+  pivot.position.set(side*0.08, 0.22, 0.42);
+  pivot.rotation.y = side>0 ? -0.28 : Math.PI + 0.28;  // sweep the forewings forward
+  foreWings.push({ pivot, side });
+  return pivot;
+}
+
+function makeHindwing(side){
+  const len = 1.9, wid = 1.5;
+  const shape = new THREE.Shape();
+  shape.moveTo(0, 0.06);
+  shape.bezierCurveTo(len*0.4, wid*0.30, len*0.85, wid*0.28, len*0.98, wid*0.02);
+  shape.bezierCurveTo(len*1.02, -wid*0.20, len*0.85, -wid*0.42, len*0.62, -wid*0.50);
+  // swallowtail streamer
+  shape.bezierCurveTo(len*0.56, -wid*0.62, len*0.52, -wid*0.86, len*0.44, -wid*0.98);
+  shape.bezierCurveTo(len*0.40, -wid*0.80, len*0.34, -wid*0.60, len*0.26, -wid*0.48);
+  shape.bezierCurveTo(len*0.14, -wid*0.34, 0.02, -wid*0.16, 0, 0.06);
+  const geo = new THREE.ExtrudeGeometry(shape, { depth:0.03, bevelEnabled:true, bevelThickness:0.014, bevelSize:0.014, bevelSegments:2, steps:1, curveSegments:26 });
+  const mat = iri(side>0 ? 0.50 : 0.56, { roughness:0.20, metalness:0.75, light:0.5, opacity:0.96, transparent:true });
+  const wing = new THREE.Mesh(geo, mat);
+
+  const border = new THREE.Mesh(geo, chitin(0x120818, { roughness:0.5, metalness:0.3 }));
+  border.scale.set(1.06, 1.06, 0.6);
+  border.position.set(-0.02, 0.0, 0.006);
+  wing.add(border);
+
+  // classic hindwing eyespot near the tail
+  wing.add(wingSpot(len*0.55, -wid*0.30, 0.16, chitin(0x0d0612,{roughness:0.4})));
+  wing.add(wingSpot(len*0.55, -wid*0.30, 0.10, iri(0.85,{light:0.55,metalness:0.7})));
+  wing.add(wingSpot(len*0.55, -wid*0.30, 0.04, chitin(0xffffff,{roughness:0.25})));
+  wing.add(wingSpot(len*0.78,  wid*0.05, 0.07, iri(0.70,{light:0.6})));
+  wing.add(wingSpot(len*0.35,  wid*0.12, 0.06, iri(0.65,{light:0.62})));
+
+  for (let vi=0; vi<5; vi++){
+    const f = vi/4;
+    const veinMat = iri(0.55 + f*0.2, { roughness:0.32, metalness:0.6, light:0.6 });
+    const vc = new THREE.QuadraticBezierCurve3(
+      new THREE.Vector3(0.04, 0, 0.045),
+      new THREE.Vector3(len*0.5, (f-0.6)*wid*0.7, 0.045),
+      new THREE.Vector3(len*(0.7 + f*0.28), (f-0.65)*wid*0.6, 0.045)
+    );
+    wing.add(new THREE.Mesh(new THREE.TubeGeometry(vc, 12, 0.010, 4, false), veinMat));
+  }
+
+  const pivot = new THREE.Group();
+  wing.rotation.x = -Math.PI/2;
+  // Fore/aft flip relative to the forewing convention: the hindwing shape is
+  // reversed on BOTH sides so the broad leading edge faces the head and the
+  // swallowtail streamers trail behind. Flipping only the right wing (and
+  // leaving the left un-flipped) applies the same shape-space mirror to each
+  // side, so the pair stays exactly bilaterally symmetric — just facing the
+  // opposite way to before.
+  if (side > 0) wing.scale.y = -1;
+  pivot.add(wing);
+  pivot.position.set(side*0.08, 0.18, 0.20);
+  pivot.rotation.y = side>0 ? 0.42 : Math.PI - 0.42;  // sweep the hindwings back
+  hindWings.push({ pivot, side });
+  return pivot;
+}
+
+function makeAntenna(side){
+  const root = new THREE.Group();
+  root.position.set(side*0.08, 0.22, 0.98);
+  root.rotation.set(-0.55, side*0.35, 0);
+  const joints = [];
+  const N = 10;
+  let parent = root;
+  for (let i=0;i<N;i++){
+    const t = i/N;
+    const antMat = iri(t*0.8, { roughness:0.4, metalness:0.4, light:0.55 });
+    const j = new THREE.Group();
+    j.userData.bx = -0.05;
+    j.userData.by = side*0.015;
+    j.rotation.set(j.userData.bx, j.userData.by, 0);
+    const segLen = 0.16;
+    j.add(segmentBetween(new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,segLen), 0.016, 0.014, antMat, 6));
+    parent.add(j);
+    const holder = new THREE.Group();
+    holder.position.set(0,0,segLen);
+    j.add(holder);
+    parent = holder;
+    joints.push(j);
+  }
+  // clubbed tip, the butterfly signature
+  const club = new THREE.Mesh(new THREE.SphereGeometry(0.045, 10, 8), iri(0.85,{light:0.55,metalness:0.6}));
+  club.scale.set(1, 1, 1.5);
+  parent.add(club);
+  antennaJoints.push({ joints, side });
+  return root;
+}
+
+function makeLeg(side, i){
+  const g = new THREE.Group();
+  g.position.set(side*0.10, -0.02, 0.55 - i*0.16);
+  const mat = iri(0.9 - i*0.05, { roughness:0.4, metalness:0.4, light:0.45 });
+  const p1 = new THREE.Vector3(side*0.10, -0.16, 0.02);
+  const p2 = new THREE.Vector3(side*0.14, -0.34, 0.10);
+  const p3 = new THREE.Vector3(side*0.15, -0.42, 0.20);
+  g.add(segmentBetween(new THREE.Vector3(0,0,0), p1, 0.020, 0.016, mat, 6));
+  g.add(segmentBetween(p1, p2, 0.015, 0.010, mat, 6));
+  g.add(segmentBetween(p2, p3, 0.009, 0.002, mat, 5));
+  legGroups.push({ g, side, i });
+  return g;
+}
+
+function createButterfly(){
+  const g = new THREE.Group();
+
+  // ---- Thorax: fuzzy central hub ----
+  const thorax = new THREE.Mesh(new THREE.SphereGeometry(0.24, 20, 16), iri(0.12,{roughness:0.5,metalness:0.35,light:0.42}));
+  thorax.scale.set(1, 1.05, 1.5);
+  thorax.position.set(0, 0.14, 0.38);
+  g.add(thorax);
+  // fuzz: tiny hair spikes
+  const hairMat = chitin(0x2a1a30, { roughness:0.7, metalness:0.05 });
+  for (let i=0;i<26;i++){
+    const a = Math.random()*Math.PI*2;
+    const zt = 0.38 + (Math.random()-0.5)*0.5;
+    const base = new THREE.Vector3(Math.cos(a)*0.21, 0.14 + Math.sin(a)*0.22, zt);
+    const tip = base.clone().add(new THREE.Vector3(Math.cos(a)*0.07, Math.sin(a)*0.07 + 0.02, 0));
+    g.add(segmentBetween(base, tip, 0.008, 0.001, hairMat, 3));
+  }
+
+  // ---- Head ----
+  const head = new THREE.Group();
+  const skull = new THREE.Mesh(new THREE.SphereGeometry(0.15, 18, 14), iri(0.06,{roughness:0.35,metalness:0.5,light:0.45}));
+  head.add(skull);
+  [-1,1].forEach(sx=>{
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.085, 16, 14), chitin(0x0a0503,{roughness:0.12,metalness:0.65}));
+    eye.scale.set(0.9, 1.15, 0.95);
+    eye.position.set(sx*0.10, 0.02, 0.05);
+    head.add(eye);
+    const gloss = new THREE.Mesh(new THREE.SphereGeometry(0.028, 8, 8), chitin(0xffffff,{roughness:0.08,metalness:0.3}));
+    gloss.position.set(sx*0.13, 0.06, 0.11);
+    head.add(gloss);
+  });
+  // coiled proboscis: shrinking spiral under the head
+  const coilPts = [];
+  for (let k=0;k<=40;k++){
+    const th = k/40 * Math.PI*3.6;
+    const r = 0.085 * (1 - k/48);
+    coilPts.push(new THREE.Vector3(0, -0.12 - Math.sin(th)*r, 0.10 + Math.cos(th)*r));
+  }
+  proboscis = new THREE.Mesh(
+    new THREE.TubeGeometry(new THREE.CatmullRomCurve3(coilPts), 60, 0.012, 5, false),
+    iri(0.95,{roughness:0.4,metalness:0.45,light:0.5})
+  );
+  head.add(proboscis);
+  head.position.set(0, 0.18, 0.86);
+  g.add(head);
+
+  g.add(makeAntenna( 1));
+  g.add(makeAntenna(-1));
+
+  // ---- Abdomen: slender, gently down-curved segments ----
+  abdomen = new THREE.Group();
+  const nSeg = 7;
+  for (let i=0;i<nSeg;i++){
+    const t = i/(nSeg-1);
+    const r = 0.16 * (1 - t*0.6);
+    const seg = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12), iri(0.30 + t*0.4, { light: i%2?0.52:0.44, metalness:0.55 }));
+    seg.scale.set(r, r*0.95, 0.16);
+    seg.position.set(0, 0.10 - t*t*0.22, 0.02 - i*0.20);
+    abdomen.add(seg);
+  }
+  g.add(abdomen);
+
+  // ---- Wings: two pairs ----
+  g.add(makeForewing( 1));
+  g.add(makeForewing(-1));
+  g.add(makeHindwing( 1));
+  g.add(makeHindwing(-1));
+
+  // ---- Six thread-thin legs, tucked beneath ----
+  for (let i=0;i<3;i++){
+    g.add(makeLeg( 1, i));
+    g.add(makeLeg(-1, i));
+  }
+
+  g.scale.setScalar(1.15);
+  return g;
+}
+
+function init(){
+  initBackground(); updateSize();
+
+  scene = new THREE.Scene();
+  scene.background = null;
+  scene.fog = new THREE.FogExp2(0x000000, 0.03);
+
+  camera = new THREE.PerspectiveCamera(46, innerWidth/innerHeight, 0.1, 1000);
+  updateCamera();
+
+  butterfly = createButterfly();
+  scene.add(butterfly);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x141020, 0.6));
+  const key = new THREE.DirectionalLight(0xffffff, 1.35); key.position.set(4,7,6); scene.add(key);
+  const rim = new THREE.PointLight(0x33ccff, 1.5, 60); rim.position.set(-6,3,-4); scene.add(rim);
+  const rim2 = new THREE.PointLight(0xff33aa, 1.3, 60); rim2.position.set(6,-2,-3); scene.add(rim2);
+  const under = new THREE.PointLight(0x8855ff, 0.7, 40); under.position.set(0,-5,3); scene.add(under);
+  const glint = new THREE.PointLight(0xffffff, 1.1, 40); glint.position.set(2,4,8); scene.add(glint);
+
+  addPointerControls();
+  animate();
+}
+
+// flapSpeed drives flutter bursts vs. gliding, like the walk bursts before
+let flapSpeed = 1.2, flapTarget = 1.2, nextBurst = 2;
+function animate(){
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const t = now * 0.001;
+
+  hueShift = (t * 0.05) % 1;
+  for (let i=0;i<iriMats.length;i++){
+    const m = iriMats[i];
+    m.color.setHSL((hueShift + m.userData.offset) % 1, m.userData.sat, m.userData.light);
+  }
+
+  // flutter in bursts, then glide with wings raised
+  if (t > nextBurst){
+    flapTarget = Math.random() < 0.4 ? 0.08 : 1.6 + Math.random()*1.6;
+    nextBurst = t + 1.0 + Math.random()*2.4;
+  }
+  flapSpeed += (flapTarget - flapSpeed) * 0.05;
+  const flapPhase = (animate.fp = (animate.fp||0) + flapSpeed * 0.14);
+  const busy = Math.min(1, flapSpeed/1.2);
+
+  // wing angle: full strokes while fluttering, a raised shallow V while gliding.
+  // Real butterfly hindwings are mechanically coupled to the forewings and beat
+  // almost together: a small phase lag and slightly smaller amplitude keeps the
+  // hindwing tucked just beneath the forewing instead of scissoring through it.
+  const stroke = Math.sin(flapPhase);
+  const flapAngle  = 0.30 + stroke*0.95;
+  const glideAngle = 0.85 + Math.sin(t*1.4)*0.06;
+  const foreA = glideAngle*(1-busy) + flapAngle*busy;
+  const hindStroke = Math.sin(flapPhase - 0.25);
+  const hindA = (glideAngle - 0.06)*(1-busy) + (0.22 + hindStroke*0.82)*busy;
+
+  foreWings.forEach(({pivot, side})=>{
+    pivot.rotation.z = foreA;
+    pivot.rotation.x = Math.sin(flapPhase - 0.3)*0.06*busy;  // slight twist through the stroke
+  });
+  hindWings.forEach(({pivot})=>{
+    pivot.rotation.z = hindA;
+    pivot.rotation.x = Math.sin(flapPhase - 0.55)*0.05*busy;
+  });
+
+  // antennae wave gently
+  antennaJoints.forEach(({joints, side})=>{
+    for (let i=0;i<joints.length;i++){
+      const tt = i/joints.length;
+      const j = joints[i];
+      j.rotation.x = j.userData.bx + Math.sin(t*2.4 - i*0.5) * 0.10 * tt;
+      j.rotation.y = j.userData.by + Math.sin(t*1.8 - i*0.5 + side*1.3) * 0.14 * tt;
+    }
+  });
+
+  // proboscis half-uncoils now and then
+  if (proboscis){
+    const sip = Math.max(0, Math.sin(t*0.5)) * 0.4;
+    proboscis.rotation.x = sip;
+    proboscis.scale.z = 1 + sip*0.6;
+  }
+
+  // abdomen counter-swings against the wingbeat
+  if (abdomen){
+    abdomen.rotation.x = 0.10 - stroke*0.10*busy + Math.sin(t*1.1)*0.03;
+  }
+
+  // legs drift with the air
+  legGroups.forEach(({g, side, i})=>{
+    g.rotation.x = 0.15 + Math.sin(t*2 + i + side)*0.05;
+  });
+
+  // hovering flight path: lift with each downstroke, drift when gliding
+  const bob = -Math.cos(flapPhase)*0.16*busy;
+  butterfly.position.y = bob + Math.sin(t*0.7)*0.28 - (1-busy)*0.25;
+  butterfly.position.x = Math.sin(t*0.45)*0.5;
+  butterfly.position.z = Math.cos(t*0.34)*0.35;
+  butterfly.rotation.z = Math.sin(t*0.6)*0.10 + stroke*0.02*busy;
+  butterfly.rotation.x = -0.08 + Math.sin(t*0.5)*0.06 - busy*0.10;
+  butterfly.rotation.y = Math.sin(t*0.28)*0.30;
+
+  if (!dragging) cam.autoYaw += 0.0014 + flapSpeed*0.0003;
+  applyCamera();
+
+  renderer.render(scene, camera);
+}
+
+let dragging=false, lastX=0, lastY=0, pinchD=0;
+function addPointerControls(){
+  const c = renderer.domElement;
+  c.addEventListener('pointerdown', e=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; c.setPointerCapture(e.pointerId); });
+  c.addEventListener('pointermove', e=>{
+    if(!dragging) return;
+    cam.targetYaw   += (e.clientX-lastX)*0.006;
+    cam.targetPitch += (e.clientY-lastY)*0.006;
+    lastX=e.clientX; lastY=e.clientY;
+  });
+  const stop=()=>dragging=false;
+  c.addEventListener('pointerup', stop);
+  c.addEventListener('pointercancel', stop);
+  c.addEventListener('pointerleave', stop);
+  c.addEventListener('wheel', e=>{ e.preventDefault(); cam.targetDist = Math.max(5, Math.min(16, cam.targetDist + e.deltaY*0.01)); }, {passive:false});
+  c.addEventListener('touchmove', e=>{
+    if(e.touches.length===2){
+      const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY;
+      const d=Math.hypot(dx,dy);
+      if(pinchD) cam.targetDist = Math.max(5, Math.min(16, cam.targetDist + (pinchD-d)*0.02));
+      pinchD=d;
+    }
+  }, {passive:true});
+  c.addEventListener('touchend', ()=>pinchD=0);
+}
+
+addEventListener('resize', ()=>{
+  updateSize();
+  initBackground();
+  if(camera){ camera.aspect = innerWidth/innerHeight; updateCamera(); }
+});
+addEventListener('load', init);
+</script>
+</body>
+</html>

@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ThreeJS: Spider 2</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #000; overflow: hidden; height: 100%; }
+  #bgCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 1; }
+  #animationCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 2; cursor: grab; touch-action: none; }
+  #animationCanvas:active { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="bgCanvas"></canvas>
+<canvas id="animationCanvas"></canvas>
+
+<script>
+const bgCanvas = document.getElementById('bgCanvas');
+const bgCtx = bgCanvas.getContext('2d');
+function initBackground(){
+  bgCanvas.width = innerWidth; bgCanvas.height = innerHeight;
+  bgCtx.fillStyle = '#000';
+  bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+}
+
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('animationCanvas'), antialias:true, alpha:true });
+let scene, camera, spider;
+const legParts = [];
+const palps = [];
+const chelicerae = [];
+let abdomenMesh = null;
+let spinnerets = [];
+
+function updateSize(){
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+}
+
+const cam = { dist: 7.5, yaw: 0.5, pitch: 0.36, targetYaw: 0.5, targetPitch: 0.36, targetDist: 7.5, autoYaw: 0 };
+function updateCamera(){
+  const w = innerWidth;
+  if (w < 480) cam.targetDist = Math.min(Math.max(cam.targetDist, 7.5), 14);
+  camera.fov = w < 480 ? 58 : w < 768 ? 52 : 46;
+  camera.updateProjectionMatrix();
+}
+function applyCamera(){
+  cam.yaw   += (cam.targetYaw   - cam.yaw)   * 0.08;
+  cam.pitch += (cam.targetPitch - cam.pitch) * 0.08;
+  cam.dist  += (cam.targetDist  - cam.dist)  * 0.08;
+  const total = cam.yaw + cam.autoYaw;
+  const p = Math.max(-1.35, Math.min(1.35, cam.pitch));
+  camera.position.set(
+    Math.sin(total)*Math.cos(p)*cam.dist,
+    Math.sin(p)*cam.dist + 0.4,
+    Math.cos(total)*Math.cos(p)*cam.dist
+  );
+  camera.lookAt(0, -0.1, -0.2);
+}
+
+function chitin(color, opts={}){
+  return new THREE.MeshStandardMaterial(Object.assign({
+    color, roughness:0.42, metalness:0.28, side:THREE.DoubleSide
+  }, opts));
+}
+
+const iriMats = [];
+let hueShift = 0;
+function iri(offset, opts={}){
+  const { sat=0.85, light=0.52, roughness=0.30, metalness=0.55, opacity=1, transparent=false } = opts;
+  const m = new THREE.MeshStandardMaterial({
+    color:0xffffff, roughness, metalness, side:THREE.DoubleSide, transparent, opacity
+  });
+  m.userData = { offset, sat, light };
+  m.color.setHSL(((offset%1)+1)%1, sat, light);
+  iriMats.push(m);
+  return m;
+}
+
+function segmentBetween(p0, p1, r0, r1, material, radialSeg=10){
+  const dir = new THREE.Vector3().subVectors(p1, p0);
+  const len = dir.length();
+  const geo = new THREE.CylinderGeometry(r1, r0, len, radialSeg, 1, false);
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.position.copy(p0).add(p1).multiplyScalar(0.5);
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.clone().normalize());
+  return mesh;
+}
+
+// Spider leg: coxa -> femur (raised) -> patella+tibia (bent down) -> metatarsus -> tarsus + claws
+function makeLeg(side, cfg){
+  const s = side;
+  const h = cfg.hue;
+  const femMat = iri(h,        { roughness:0.32, metalness:0.55 });
+  const tibMat = iri(h+0.06,   { roughness:0.30, metalness:0.58, light:0.56 });
+  const metMat = iri(h+0.12,   { roughness:0.32, metalness:0.5,  light:0.5  });
+  const darkMat= iri(h-0.04,   { roughness:0.42, metalness:0.45, light:0.38 });
+  const hairMat= chitin(0x120a08, { roughness:0.65, metalness:0.08 });
+
+  const Lf = cfg.fem, Lt = cfg.tib, Lm = cfg.met;
+  const femLift = 0.82;   // femur raised up
+  const patBend = 1.75;   // hard bend down at the patella
+  const metBend = 0.30;   // slight continuation at metatarsus
+
+  const root = new THREE.Group();
+  root.position.set(s*cfg.hipX, cfg.hipY, cfg.hipZ);
+  root.rotation.y = cfg.yaw;
+
+  // coxa + trochanter
+  const coxaEnd = new THREE.Vector3(s*0.20, 0.02, 0);
+  root.add(segmentBetween(new THREE.Vector3(0,0,0), coxaEnd, 0.075, 0.062, darkMat, 8));
+
+  // femur, angled upward
+  const femur = new THREE.Group();
+  femur.position.copy(coxaEnd);
+  femur.rotation.z = s*femLift;
+  root.add(femur);
+  const femEnd = new THREE.Vector3(s*Lf, 0, 0);
+  femur.add(segmentBetween(new THREE.Vector3(0,0,0), femEnd, 0.060, 0.044, femMat, 10));
+
+  // patella knob at the joint
+  const patella = new THREE.Mesh(new THREE.SphereGeometry(0.052, 10, 8), darkMat);
+  patella.position.copy(femEnd);
+  femur.add(patella);
+
+  // tibia, bent sharply down
+  const knee = new THREE.Group();
+  knee.position.copy(femEnd);
+  knee.rotation.z = -s*patBend;
+  femur.add(knee);
+  const tibEnd = new THREE.Vector3(s*Lt, 0, 0);
+  knee.add(segmentBetween(new THREE.Vector3(0,0,0), tibEnd, 0.042, 0.030, tibMat, 9));
+
+  // metatarsus, continuing down and out
+  const meta = new THREE.Group();
+  meta.position.copy(tibEnd);
+  meta.rotation.z = -s*metBend;
+  knee.add(meta);
+  const metEnd = new THREE.Vector3(s*Lm, 0, 0);
+  meta.add(segmentBetween(new THREE.Vector3(0,0,0), metEnd, 0.028, 0.018, metMat, 8));
+
+  // tarsus: short tapering tip segments
+  let prev = metEnd.clone();
+  for (let k=0;k<3;k++){
+    const nt = prev.clone().add(new THREE.Vector3(s*0.09, -0.020 - k*0.008, 0));
+    meta.add(segmentBetween(prev, nt, 0.017 - k*0.004, 0.013 - k*0.004, darkMat, 6));
+    prev = nt;
+  }
+  // paired claws
+  [-1,1].forEach(cs=>{
+    const claw = prev.clone().add(new THREE.Vector3(s*0.05, -0.035, cs*0.02));
+    meta.add(segmentBetween(prev, claw, 0.010, 0.001, hairMat, 4));
+  });
+
+  // fine hairs / setae along segments
+  function addHairs(parent, a, b, count, rad){
+    for (let i=1;i<=count;i++){
+      const t = i/(count+1);
+      const base = new THREE.Vector3().lerpVectors(a, b, t);
+      const ang = (i%2 ? 1 : -1) * 0.6;
+      const tip = base.clone().add(new THREE.Vector3(0, -rad, Math.sin(ang)*rad*0.6));
+      parent.add(segmentBetween(base, tip, rad*0.32, 0.001, hairMat, 4));
+    }
+  }
+  addHairs(femur, new THREE.Vector3(0,0,0), femEnd, 4, 0.07);
+  addHairs(knee,  new THREE.Vector3(0,0,0), tibEnd, 6, 0.065);
+  addHairs(meta,  new THREE.Vector3(0,0,0), metEnd, 5, 0.05);
+
+  legParts.push({
+    root, femur, knee, meta, side:s,
+    baseYaw:cfg.yaw, baseFemur:s*femLift, baseKnee:-s*patBend, baseMeta:-s*metBend,
+    phase:cfg.phase, swing:cfg.swing
+  });
+  return root;
+}
+
+// Pedipalps: small leg-like feelers at the front
+function makePalp(side){
+  const s = side;
+  const root = new THREE.Group();
+  root.position.set(s*0.16, -0.10, 1.18);
+  root.rotation.y = s*-0.5;
+  let prev = new THREE.Vector3(0,0,0);
+  const dirs = [
+    new THREE.Vector3(s*0.14,  0.10, 0.16),
+    new THREE.Vector3(s*0.10, -0.02, 0.16),
+    new THREE.Vector3(s*0.05, -0.10, 0.12)
+  ];
+  for (let k=0;k<3;k++){
+    const nt = prev.clone().add(dirs[k]);
+    root.add(segmentBetween(prev, nt, 0.045-k*0.008, 0.038-k*0.008, iri(0.88+k*0.04,{roughness:0.38}), 6));
+    prev = nt;
+  }
+  // clubbed tip (like a male spider's palp bulb)
+  const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.055,10,8), iri(0.97,{light:0.5,metalness:0.6}));
+  bulb.position.copy(prev);
+  root.add(bulb);
+  palps.push({ palp:root, side:s, baseX:root.rotation.x });
+  return root;
+}
+
+// Chelicerae with downward-curving fangs
+function makeChelicera(side){
+  const s = side;
+  const root = new THREE.Group();
+  root.position.set(s*0.09, -0.16, 1.30);
+  const base = segmentBetween(new THREE.Vector3(0,0,0), new THREE.Vector3(0,-0.22,0.05), 0.07, 0.05, iri(0.02,{light:0.42,metalness:0.6}), 8);
+  root.add(base);
+  // fang: curved spike
+  const fangCurve = new THREE.QuadraticBezierCurve3(
+    new THREE.Vector3(0,-0.22,0.05),
+    new THREE.Vector3(s*0.02,-0.34,0.10),
+    new THREE.Vector3(s*-0.03,-0.40,0.02)
+  );
+  const fang = new THREE.Mesh(new THREE.TubeGeometry(fangCurve, 8, 0.020, 6, false), chitin(0x150b06,{roughness:0.2,metalness:0.5}));
+  root.add(fang);
+  chelicerae.push({ root, side:s });
+  return root;
+}
+
+function createSpider(){
+  const g = new THREE.Group();
+
+  // ---- Cephalothorax (prosoma) ----
+  const ceph = new THREE.Group();
+  const carapace = new THREE.Mesh(new THREE.SphereGeometry(0.62, 28, 20), iri(0.10,{roughness:0.24,metalness:0.62,light:0.5}));
+  carapace.scale.set(0.92, 0.55, 1.0);
+  ceph.add(carapace);
+  // raised head region / fovea ridge
+  const ridge = new THREE.Mesh(new THREE.SphereGeometry(0.34, 20, 14), iri(0.16,{roughness:0.22,metalness:0.7,light:0.55}));
+  ridge.scale.set(0.85, 0.6, 0.9);
+  ridge.position.set(0, 0.18, 0.28);
+  ceph.add(ridge);
+  // sternum underneath
+  const sternum = new THREE.Mesh(new THREE.SphereGeometry(0.42, 18, 12), iri(0.05,{light:0.4,metalness:0.5}));
+  sternum.scale.set(0.85, 0.35, 0.95);
+  sternum.position.set(0, -0.16, 0);
+  ceph.add(sternum);
+  ceph.position.set(0, 0.05, 0.65);
+  g.add(ceph);
+
+  // ---- Eyes: cluster of 8 ----
+  const eyeMat = chitin(0x0a0503, { roughness:0.12, metalness:0.65 });
+  const glossMat = chitin(0xffffff, { roughness:0.08, metalness:0.3 });
+  const eyeDefs = [
+    // two big anterior median eyes
+    { x: 0.11, y: 0.38, z: 1.14, r: 0.085 },
+    { x:-0.11, y: 0.38, z: 1.14, r: 0.085 },
+    // anterior laterals
+    { x: 0.24, y: 0.36, z: 1.06, r: 0.05 },
+    { x:-0.24, y: 0.36, z: 1.06, r: 0.05 },
+    // posterior medians
+    { x: 0.09, y: 0.48, z: 1.02, r: 0.045 },
+    { x:-0.09, y: 0.48, z: 1.02, r: 0.045 },
+    // posterior laterals
+    { x: 0.26, y: 0.46, z: 0.94, r: 0.045 },
+    { x:-0.26, y: 0.46, z: 0.94, r: 0.045 }
+  ];
+  eyeDefs.forEach(e=>{
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(e.r, 14, 12), eyeMat);
+    eye.position.set(e.x, e.y, e.z);
+    g.add(eye);
+    const gloss = new THREE.Mesh(new THREE.SphereGeometry(e.r*0.32, 8, 8), glossMat);
+    gloss.position.set(e.x*1.02, e.y + e.r*0.4, e.z + e.r*0.55);
+    g.add(gloss);
+  });
+
+  // ---- Chelicerae & pedipalps ----
+  g.add(makeChelicera( 1));
+  g.add(makeChelicera(-1));
+  g.add(makePalp( 1));
+  g.add(makePalp(-1));
+
+  // ---- Abdomen (opisthosoma): big iridescent bulb ----
+  const abGroup = new THREE.Group();
+  const ab = new THREE.Mesh(new THREE.SphereGeometry(0.95, 32, 24), iri(0.55,{roughness:0.22,metalness:0.62,light:0.5}));
+  ab.scale.set(0.88, 0.82, 1.15);
+  abGroup.add(ab);
+  abdomenMesh = ab;
+  // dorsal folium pattern: bands of small plates down the back
+  for (let i=0;i<6;i++){
+    const t = i/5;
+    const band = new THREE.Mesh(new THREE.SphereGeometry(0.16*(1-t*0.55), 12, 10), iri(0.62 + t*0.3, { light:0.6, metalness:0.6 }));
+    band.scale.set(1.6 - t*0.9, 0.5, 0.8);
+    band.position.set(0, 0.62 - t*0.28, 0.5 - t*1.35);
+    abGroup.add(band);
+    if (i<5) [-1,1].forEach(sx=>{
+      const spot = new THREE.Mesh(new THREE.SphereGeometry(0.07,8,8), iri(0.5 - t*0.2,{light:0.62}));
+      spot.position.set(sx*(0.55 - t*0.22), 0.42 - t*0.2, 0.45 - t*1.3);
+      abGroup.add(spot);
+    });
+  }
+  // spinnerets at the rear tip
+  for (let i=0;i<3;i++){
+    const a = (i-1)*0.5;
+    const p0 = new THREE.Vector3(Math.sin(a)*0.12, -0.30, -1.05);
+    const p1 = new THREE.Vector3(Math.sin(a)*0.22, -0.42, -1.28);
+    const sp = segmentBetween(p0, p1, 0.05, 0.015, iri(0.95,{roughness:0.4,metalness:0.5}), 6);
+    abGroup.add(sp);
+    spinnerets.push(sp);
+  }
+  // pedicel (thin waist joining the two body parts)
+  abGroup.add(segmentBetween(new THREE.Vector3(0,0.02,0.6), new THREE.Vector3(0,0.05,1.0), 0.16, 0.14, iri(0.3,{light:0.4}), 10));
+  abGroup.position.set(0, 0.28, -0.85);
+  abGroup.rotation.x = 0.32;
+  g.add(abGroup);
+  g.userData.abdomen = abGroup;
+
+  // ---- Eight legs, four pairs ----
+  // yaw < 0 points forward, > 0 points backward (mirrored for the left side)
+  const legCfg = [
+    { hipX:0.42, hipY:-0.02, hipZ:0.92, yaw:-1.05, fem:1.00, tib:1.05, met:0.85, swing:0.16, hue:0.00 },
+    { hipX:0.50, hipY:-0.04, hipZ:0.62, yaw:-0.40, fem:1.05, tib:1.10, met:0.90, swing:0.18, hue:0.25 },
+    { hipX:0.50, hipY:-0.05, hipZ:0.34, yaw: 0.35, fem:0.95, tib:1.00, met:0.80, swing:0.18, hue:0.55 },
+    { hipX:0.44, hipY:-0.04, hipZ:0.08, yaw: 0.95, fem:1.15, tib:1.20, met:1.00, swing:0.16, hue:0.80 },
+  ];
+  // alternating tetrapod gait: R1,R3,L2,L4 step together; the rest counter-phase
+  legCfg.forEach((c, i)=>{
+    const phR = (i%2===0) ? 0 : Math.PI;
+    g.add(makeLeg( 1, Object.assign({}, c, { phase:phR })));
+    g.add(makeLeg(-1, Object.assign({}, c, { yaw:-c.yaw, phase:phR + Math.PI })));
+  });
+
+  g.scale.setScalar(1.35);
+  g.position.y = 0.2;
+  return g;
+}
+
+function init(){
+  initBackground(); updateSize();
+
+  scene = new THREE.Scene();
+  scene.background = null;
+  scene.fog = new THREE.FogExp2(0x000000, 0.03);
+
+  camera = new THREE.PerspectiveCamera(46, innerWidth/innerHeight, 0.1, 1000);
+  updateCamera();
+
+  spider = createSpider();
+  scene.add(spider);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x141020, 0.6));
+  const key = new THREE.DirectionalLight(0xffffff, 1.35); key.position.set(4,7,6); scene.add(key);
+  const rim = new THREE.PointLight(0x33ccff, 1.5, 60); rim.position.set(-6,3,-4); scene.add(rim);
+  const rim2 = new THREE.PointLight(0xff33aa, 1.3, 60); rim2.position.set(6,-2,-3); scene.add(rim2);
+  const under = new THREE.PointLight(0x8855ff, 0.6, 40); under.position.set(0,-5,3); scene.add(under);
+  const glint = new THREE.PointLight(0xffffff, 1.1, 40); glint.position.set(2,4,8); scene.add(glint);
+
+  addPointerControls();
+  animate();
+}
+
+let gaitSpeed = 0.8, gaitTarget = 0.8, nextBurst = 2;
+function animate(){
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const t = now * 0.001;
+
+  hueShift = (t * 0.05) % 1;
+  for (let i=0;i<iriMats.length;i++){
+    const m = iriMats[i];
+    m.color.setHSL((hueShift + m.userData.offset) % 1, m.userData.sat, m.userData.light);
+  }
+
+  // spiders freeze, then scuttle in bursts
+  if (t > nextBurst){
+    gaitTarget = Math.random() < 0.45 ? 0.05 : 2.4 + Math.random()*2.8;
+    nextBurst = t + 0.7 + Math.random()*2.4;
+  }
+  gaitSpeed += (gaitTarget - gaitSpeed) * 0.045;
+  const walk = (animate.wt = (animate.wt||0) + gaitSpeed * 0.055);
+
+  legParts.forEach(L=>{
+    const ph = walk + L.phase;
+    const swingLift = Math.max(0, Math.cos(ph));
+    const ease = swingLift * swingLift * (3 - 2*swingLift);
+    L.root.rotation.y  = L.baseYaw   + L.side * L.swing * Math.sin(ph);
+    L.femur.rotation.z = L.baseFemur + L.side * 0.28 * ease;
+    L.knee.rotation.z  = L.baseKnee  - L.side * 0.22 * ease;
+    L.meta.rotation.z  = L.baseMeta  - L.side * 0.10 * ease;
+  });
+
+  // pedipalps tap and probe
+  palps.forEach(({palp, side})=>{
+    palp.rotation.x = Math.sin(t*5.5 + side)*0.28;
+    palp.rotation.y = side*-0.5 + Math.sin(t*3.2 + side*2)*0.12;
+  });
+
+  // chelicerae twitch faintly
+  chelicerae.forEach(({root, side})=>{
+    root.rotation.x = Math.sin(t*4 + side*1.7)*0.06;
+  });
+
+  // abdomen breathing pulse + slight bob
+  if (spider.userData.abdomen){
+    const abd = spider.userData.abdomen;
+    const pulse = 1 + Math.sin(t*2.1)*0.02;
+    abdomenMesh.scale.set(0.88*pulse, 0.82*pulse, 1.15);
+    abd.rotation.x = 0.32 + Math.sin(t*1.3)*0.03;
+  }
+
+  const busy = Math.min(1, gaitSpeed/2);
+  spider.position.y = 0.2 + Math.sin(walk*2)*0.035*busy - 0.05;
+  spider.position.x = Math.sin(walk)*0.02*busy;
+  spider.rotation.z = Math.sin(walk*2)*0.018*busy;
+  spider.rotation.x = Math.sin(t*0.9)*0.02;
+
+  if (!dragging) cam.autoYaw += 0.0016 + gaitSpeed*0.00025;
+  applyCamera();
+
+  renderer.render(scene, camera);
+}
+
+let dragging=false, lastX=0, lastY=0, pinchD=0;
+function addPointerControls(){
+  const c = renderer.domElement;
+  c.addEventListener('pointerdown', e=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; c.setPointerCapture(e.pointerId); });
+  c.addEventListener('pointermove', e=>{
+    if(!dragging) return;
+    cam.targetYaw   += (e.clientX-lastX)*0.006;
+    cam.targetPitch += (e.clientY-lastY)*0.006;
+    lastX=e.clientX; lastY=e.clientY;
+  });
+  const stop=()=>dragging=false;
+  c.addEventListener('pointerup', stop);
+  c.addEventListener('pointercancel', stop);
+  c.addEventListener('pointerleave', stop);
+  c.addEventListener('wheel', e=>{ e.preventDefault(); cam.targetDist = Math.max(5, Math.min(17, cam.targetDist + e.deltaY*0.01)); }, {passive:false});
+  c.addEventListener('touchmove', e=>{
+    if(e.touches.length===2){
+      const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY;
+      const d=Math.hypot(dx,dy);
+      if(pinchD) cam.targetDist = Math.max(5, Math.min(17, cam.targetDist + (pinchD-d)*0.02));
+      pinchD=d;
+    }
+  }, {passive:true});
+  c.addEventListener('touchend', ()=>pinchD=0);
+}
+
+addEventListener('resize', ()=>{
+  updateSize();
+  initBackground();
+  if(camera){ camera.aspect = innerWidth/innerHeight; updateCamera(); }
+});
+addEventListener('load', init);
+</script>
+</body>
+</html>

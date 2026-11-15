@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aether — Bumble Bee</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; overflow: hidden; height: 100vh; cursor: grab; }
+        body.dragging { cursor: grabbing; }
+        #bgCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+        #animationCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; }
+    </style>
+</head>
+<body>
+    <canvas id="bgCanvas"></canvas>
+    <canvas id="animationCanvas"></canvas>
+
+    <script>
+        const colors = {
+            primary: 0x4db8d4,
+            dark1:   0x0d2a3a,
+            dark3:   0x000000,
+            light:   0xaee8f5
+        };
+
+        // ── THEME SYNC ──
+        function syncTheme() {
+            try {
+                let isDark = true;
+                if (window.parent && window.parent.document) {
+                    isDark = window.parent.document.documentElement.classList.contains('dark');
+                }
+                if (!isDark) {
+                    document.body.style.backgroundColor = '#ffffff';
+                    colors.dark3 = 0xffffff;
+                    colors.dark1 = 0xcccccc;
+                    if (typeof scene !== 'undefined' && scene) {
+                        scene.background = new THREE.Color(colors.dark3);
+                    }
+                } else {
+                    document.body.style.backgroundColor = '#000000';
+                    colors.dark3 = 0x000000;
+                    colors.dark1 = 0x0d2a3a;
+                    if (typeof scene !== 'undefined' && scene) {
+                        scene.background = new THREE.Color(colors.dark3);
+                    }
+                }
+            } catch (e) {}
+        }
+        syncTheme();
+        if (window.parent && window.parent.document) {
+            try {
+                var observer = new MutationObserver(syncTheme);
+                observer.observe(window.parent.document.documentElement, { attributes: true, attributeFilter: ['class'] });
+            } catch(e) {}
+        }
+
+        // ── Background ──
+        const bgCanvas = document.getElementById('bgCanvas');
+        const bgCtx = bgCanvas.getContext('2d');
+        const pixelSize = 8;
+        let cols, rows, pixels = [];
+
+        // Precomputed color ramp so we don't build strings every pixel, every frame
+        const RAMP_STEPS = 48;
+        const ramp = Array.from({ length: RAMP_STEPS + 1 }, (_, i) => {
+            const b = (i / RAMP_STEPS) * 0.4;
+            return `rgb(${Math.floor(b*10)},${Math.floor(b*30)},${Math.floor(b*50)})`;
+        });
+
+        function initBackground() {
+            bgCanvas.width = window.innerWidth;
+            bgCanvas.height = window.innerHeight;
+            cols = Math.ceil(bgCanvas.width / pixelSize);
+            rows = Math.ceil(bgCanvas.height / pixelSize);
+            pixels = [];
+            for (let i = 0; i < cols * rows; i++)
+                pixels.push({ brightness: Math.random() * 0.3, speed: 0.001 + Math.random() * 0.003 });
+        }
+
+        let bgFrame = 0;
+        function animateBackground() {
+            // Half the frame rate is imperceptible here and halves the fill cost
+            if ((bgFrame++ & 1) === 0) {
+                for (let y = 0; y < rows; y++) {
+                    for (let x = 0; x < cols; x++) {
+                        const p = pixels[y * cols + x];
+                        p.brightness += p.speed * 2;
+                        if (p.brightness > 0.4) p.brightness = 0;
+                        bgCtx.fillStyle = ramp[Math.min(RAMP_STEPS, (p.brightness * RAMP_STEPS / 0.4) | 0)];
+                        bgCtx.fillRect(x * pixelSize, y * pixelSize, pixelSize, pixelSize);
+                    }
+                }
+            }
+            requestAnimationFrame(animateBackground);
+        }
+
+        // ── Three.js ──
+        const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('animationCanvas'), antialias: true, alpha: true });
+        let scene, camera, bee;
+        let wings = [], antennae = [], legs = [];
+
+        function updateSize() {
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        }
+
+        function updateCamera() {
+            const w = window.innerWidth;
+            if (w < 480)      { camera.position.set(0, 0.6, 10.5); camera.fov = 55; }
+            else if (w < 768) { camera.position.set(0, 0.55, 9);   camera.fov = 52; }
+            else              { camera.position.set(0, 0.5, 7.5);  camera.fov = 50; }
+            camera.lookAt(0, 0, 0.1);
+            camera.updateProjectionMatrix();
+        }
+
+        // Wireframe MeshBasicMaterial ignores lights, so materials can be
+        // shared freely — one per color instead of one per mesh.
+        const matCache = new Map();
+        function mat(color) {
+            if (!matCache.has(color))
+                matCache.set(color, new THREE.MeshBasicMaterial({ color, wireframe: true }));
+            return matCache.get(color);
+        }
+
+        function tube(p0, p1, radius, color, mid) {
+            const pts = mid ? [p0, mid, p1] : [p0, p1];
+            const curve = new THREE.CatmullRomCurve3(pts);
+            return new THREE.Mesh(new THREE.TubeGeometry(curve, 8, radius, 6, false), mat(color));
+        }
+
+        function ball(r, color, x, y, z, sx=1, sy=1, sz=1) {
+            const m = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 20), mat(color));
+            m.position.set(x, y, z);
+            m.scale.set(sx, sy, sz);
+            return m;
+        }
+
+        // Scatter fuzz spheres around a body part — the bumble bee's coat
+        function addFuzz(group, cx, cy, cz, radius, count, color) {
+            for (let i = 0; i < count; i++) {
+                const phi   = Math.acos(2 * Math.random() - 1);
+                const theta = Math.random() * Math.PI * 2;
+                const r     = radius + 0.015 + Math.random() * 0.04;
+                const fuzz  = new THREE.Mesh(new THREE.SphereGeometry(0.018 + Math.random()*0.014, 4, 4), mat(color));
+                fuzz.position.set(
+                    cx + r * Math.sin(phi) * Math.cos(theta),
+                    cy + r * Math.sin(phi) * Math.sin(theta),
+                    cz + r * Math.cos(phi)
+                );
+                group.add(fuzz);
+            }
+        }
+
+        // NOTE: like the mosquito (and unlike the walkers), this model faces
+        // −Z: head at z ≈ −0.78, abdomen trailing to +Z.
+
+        function makeWing(side, isFore) {
+            const group = new THREE.Group();
+            const s = side;
+            const wingMat = new THREE.MeshBasicMaterial({
+                color: colors.light, wireframe: true, side: THREE.DoubleSide,
+                transparent: true, opacity: 0.85
+            });
+
+            if (isFore) {
+                const shape = new THREE.Shape();
+                shape.moveTo(0, 0);
+                shape.bezierCurveTo(s*0.4, 0.30, s*1.1, 0.55, s*1.7, 0.40);
+                shape.bezierCurveTo(s*2.1, 0.28, s*2.2, 0.05, s*2.0, -0.18);
+                shape.bezierCurveTo(s*1.7, -0.38, s*1.0, -0.45, s*0.4, -0.28);
+                shape.bezierCurveTo(s*0.12, -0.16, 0, -0.06, 0, 0);
+                const geo = new THREE.ShapeGeometry(shape, 14);
+                group.add(new THREE.Mesh(geo, wingMat));
+                group.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+                    new THREE.LineBasicMaterial({ color: colors.light })));
+
+                [
+                    { pts: [[0,0],[s*0.7,0.36],[s*1.5,0.36],[s*2.0,0.16]], r: 0.012 },
+                    { pts: [[s*0.05,-0.05],[s*0.6,0.22],[s*1.3,0.22],[s*1.85,0.04]], r: 0.009 },
+                    { pts: [[s*0.08,-0.08],[s*0.5,0.06],[s*1.1,0.02],[s*1.7,-0.12]], r: 0.008 },
+                    { pts: [[s*0.1,-0.12],[s*0.5,-0.10],[s*1.0,-0.18],[s*1.6,-0.30]], r: 0.007 },
+                ].forEach(v => {
+                    const pts = v.pts.map(p => new THREE.Vector3(p[0], p[1], 0.01));
+                    group.add(new THREE.Mesh(
+                        new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 8, v.r, 4, false),
+                        mat(colors.primary)
+                    ));
+                });
+                [[s*0.55,0.22,s*0.60,-0.04],[s*1.0,0.20,s*1.05,-0.10],[s*1.4,0.14,s*1.45,-0.20]].forEach(cv => {
+                    const pts = [new THREE.Vector3(cv[0],cv[1],0.01), new THREE.Vector3(cv[2],cv[3],0.01)];
+                    group.add(new THREE.Mesh(
+                        new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 3, 0.005, 4, false),
+                        mat(colors.primary)
+                    ));
+                });
+
+            } else {
+                const shape2 = new THREE.Shape();
+                shape2.moveTo(0, 0);
+                shape2.bezierCurveTo(s*0.3, 0.18, s*0.9, 0.32, s*1.3, 0.20);
+                shape2.bezierCurveTo(s*1.6, 0.10, s*1.6, -0.10, s*1.4, -0.22);
+                shape2.bezierCurveTo(s*1.1, -0.34, s*0.5, -0.30, s*0.15, -0.14);
+                shape2.bezierCurveTo(s*0.04, -0.06, 0, 0, 0, 0);
+                const geo = new THREE.ShapeGeometry(shape2, 10);
+                group.add(new THREE.Mesh(geo, wingMat));
+                group.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+                    new THREE.LineBasicMaterial({ color: colors.light })));
+
+                [[s*0.05,-0.03,s*0.8,0.18,s*1.25,0.06],[s*0.08,-0.08,s*0.6,0.00,s*1.1,-0.14]].forEach(v => {
+                    const pts = [
+                        new THREE.Vector3(v[0],v[1],0.01),
+                        new THREE.Vector3(v[2],v[3],0.01),
+                        new THREE.Vector3(v[4],v[5],0.01)
+                    ];
+                    group.add(new THREE.Mesh(
+                        new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 6, 0.007, 4, false),
+                        mat(colors.primary)
+                    ));
+                });
+            }
+            return group;
+        }
+
+        function createBee() {
+            const group = new THREE.Group();
+
+            // ── ABDOMEN ── banded segments, trailing to +Z, with fuzz on the
+            // (formerly yellow) alternating bands and stripe rings between
+            const abdData = [
+                { r: 0.30, col: colors.primary, fuzzy: true,  z: 0.12 },
+                { r: 0.36, col: colors.dark1,   fuzzy: false, z: 0.42 },
+                { r: 0.38, col: colors.primary, fuzzy: true,  z: 0.72 },
+                { r: 0.33, col: colors.dark1,   fuzzy: false, z: 1.00 },
+                { r: 0.22, col: colors.primary, fuzzy: true,  z: 1.26 },
+                { r: 0.12, col: colors.dark1,   fuzzy: false, z: 1.48 },
+            ];
+            abdData.forEach((s, i) => {
+                const next = abdData[i + 1];
+                const rTop = next ? next.r : s.r * 0.5;
+                const seg = new THREE.Mesh(
+                    new THREE.CylinderGeometry(rTop * 0.92, s.r, 0.32, 16, 1),
+                    mat(s.col)
+                );
+                seg.rotation.x = Math.PI * 0.5;
+                seg.position.set(0, 0, s.z);
+                group.add(seg);
+
+                if (s.fuzzy) addFuzz(group, 0, 0, s.z, s.r, 18, colors.light);
+
+                const ring = new THREE.Mesh(new THREE.TorusGeometry(s.r + 0.01, 0.010, 6, 18), mat(colors.light));
+                ring.position.set(0, 0, s.z);
+                group.add(ring);
+            });
+
+            // Stinger
+            const stingCurve = new THREE.CatmullRomCurve3([
+                new THREE.Vector3(0, 0, 1.62),
+                new THREE.Vector3(0, -0.04, 1.76),
+                new THREE.Vector3(0, -0.06, 1.88),
+            ]);
+            group.add(new THREE.Mesh(new THREE.TubeGeometry(stingCurve, 6, 0.016, 5, false), mat(colors.dark1)));
+            const stingTip = new THREE.Mesh(new THREE.ConeGeometry(0.010, 0.05, 5), mat(colors.dark1));
+            stingTip.rotation.x = 0.4;
+            stingTip.position.set(0, -0.07, 1.92);
+            group.add(stingTip);
+
+            // ── THORAX ── round and very fuzzy, with a collar
+            group.add(ball(0.42, colors.primary, 0, 0.06, -0.28, 1.0, 1.05, 1.15));
+            addFuzz(group, 0, 0.06, -0.28, 0.44, 60, colors.light);
+
+            const collar = new THREE.Mesh(new THREE.TorusGeometry(0.30, 0.040, 8, 20), mat(colors.primary));
+            collar.rotation.x = Math.PI * 0.5;
+            collar.position.set(0, 0.08, -0.48);
+            group.add(collar);
+
+            // ── HEAD ──
+            group.add(ball(0.26, colors.dark1, 0, 0.00, -0.78, 1.0, 0.95, 1.0));
+            addFuzz(group, 0, 0.00, -0.78, 0.27, 22, colors.light);
+
+            // Compound eyes with facet detail
+            [-1, 1].forEach(side => {
+                group.add(ball(0.14, colors.light, side * 0.21, 0.04, -0.80, 0.70, 0.90, 0.80));
+                for (let fi = 0; fi < 6; fi++) {
+                    const facet = new THREE.Mesh(new THREE.CircleGeometry(0.035, 6), mat(colors.primary));
+                    const ang = (fi / 6) * Math.PI * 1.6 - 0.4;
+                    facet.position.set(
+                        side * (0.24 + Math.cos(ang)*0.04),
+                        0.04 + Math.sin(ang)*0.06,
+                        -0.78
+                    );
+                    group.add(facet);
+                }
+            });
+
+            // ── ANTENNAE ── elbowed (scape + pedicel + flagellum), in
+            // pivoting groups at the scape base so they can sway
+            [-1, 1].forEach(side => {
+                const grp = new THREE.Group();
+                grp.position.set(side*0.08, 0.14, -0.90);
+
+                const scape = new THREE.CatmullRomCurve3([
+                    new THREE.Vector3(0, 0, 0),
+                    new THREE.Vector3(side*0.06, 0.14, -0.06),
+                    new THREE.Vector3(side*0.10, 0.26, -0.08),
+                ]);
+                grp.add(new THREE.Mesh(new THREE.TubeGeometry(scape, 6, 0.016, 5, false), mat(colors.dark1)));
+                grp.add(ball(0.028, colors.primary, side*0.10, 0.28, -0.08)); // pedicel
+
+                const flagellum = new THREE.CatmullRomCurve3([
+                    new THREE.Vector3(side*0.10, 0.28, -0.08),
+                    new THREE.Vector3(side*0.24, 0.32, -0.06),
+                    new THREE.Vector3(side*0.36, 0.26,  0.00),
+                    new THREE.Vector3(side*0.44, 0.18,  0.06),
+                ]);
+                grp.add(new THREE.Mesh(new THREE.TubeGeometry(flagellum, 8, 0.011, 5, false), mat(colors.dark1)));
+                grp.add(ball(0.022, colors.primary, side*0.44, 0.18, 0.06));
+
+                group.add(grp);
+                antennae.push({ group: grp, side });
+            });
+
+            // ── PROBOSCIS + MANDIBLES ──
+            const probCurve = new THREE.CatmullRomCurve3([
+                new THREE.Vector3(0, -0.14, -0.90),
+                new THREE.Vector3(0, -0.22, -1.00),
+                new THREE.Vector3(0, -0.26, -1.12),
+            ]);
+            group.add(new THREE.Mesh(new THREE.TubeGeometry(probCurve, 6, 0.018, 5, false), mat(colors.primary)));
+            group.add(ball(0.025, colors.light, 0, -0.28, -1.14)); // tongue tip
+
+            [-1, 1].forEach(side => {
+                const curve = new THREE.CatmullRomCurve3([
+                    new THREE.Vector3(side*0.08, -0.10, -0.92),
+                    new THREE.Vector3(side*0.16, -0.18, -1.02),
+                ]);
+                group.add(new THREE.Mesh(new THREE.TubeGeometry(curve, 3, 0.014, 4, false), mat(colors.dark1)));
+            });
+
+            // ── WINGS ── fore + hind pairs, pivoting at the wing roots
+            const wingDefs = [
+                { side: -1, fore: true,  x: 0, y: 0.16, z: -0.30, rz:  0.08, rx: -0.12 },
+                { side:  1, fore: true,  x: 0, y: 0.16, z: -0.30, rz: -0.08, rx: -0.12 },
+                { side: -1, fore: false, x: 0, y: 0.10, z: -0.10, rz:  0.12, rx: -0.10 },
+                { side:  1, fore: false, x: 0, y: 0.10, z: -0.10, rz: -0.12, rx: -0.10 },
+            ];
+            wingDefs.forEach(def => {
+                const pivot = new THREE.Group();
+                pivot.position.set(def.x, def.y, def.z);
+                pivot.add(makeWing(def.side, def.fore));
+                group.add(pivot);
+                wings.push({ group: pivot, side: def.side, fore: def.fore, base: { rz: def.rz, rx: def.rx } });
+            });
+
+            // ── LEGS ──
+            // Family fan-sector architecture with forward = −Z (as on the
+            // mosquito — the −cos is deliberate). Chunky bee legs hang down
+            // at hover; the hind pair is longer, thicker, and carries the
+            // pollen baskets on the tibia.
+            const pairs = [
+                { attachZ: -0.52, fanAngle: Math.PI * 0.28, scale: 0.90 }, // fore
+                { attachZ: -0.30, fanAngle: Math.PI * 0.50, scale: 1.00 }, // mid
+                { attachZ: -0.06, fanAngle: Math.PI * 0.72, scale: 1.15 }, // hind — pollen baskets
+            ];
+
+            pairs.forEach((pair, pi) => {
+                [-1, 1].forEach(side => {
+                    const isHind = pi === 2;
+                    const oX = side * Math.sin(pair.fanAngle);
+                    const oZ = -Math.cos(pair.fanAngle); // forward is −Z here
+                    const sc = pair.scale;
+
+                    const legGroup = new THREE.Group();
+                    legGroup.position.set(side * 0.38, -0.08, pair.attachZ);
+
+                    let h = 0, v = 0;
+                    const joint = (dh, dv) => {
+                        h += dh; v += dv;
+                        return new THREE.Vector3(oX * h * sc, v * sc, oZ * h * sc);
+                    };
+
+                    const root = new THREE.Vector3();
+                    const cox1 = joint(0.16, -0.06);  // coxa
+                    const fem1 = joint(0.38, -0.22);  // femur hangs out-down
+                    const tib1 = joint(0.34, -0.30);  // tibia
+                    const ta1  = joint(0.14, -0.10);  // three tarsal segments
+                    const ta2  = joint(0.12, -0.07);
+                    const ta3  = joint(0.10, -0.05);
+
+                    legGroup.add(tube(root, cox1, 0.030, colors.dark1));
+                    legGroup.add(ball(0.036, colors.light, cox1.x, cox1.y, cox1.z)); // trochanter
+                    legGroup.add(tube(cox1, fem1, 0.028, isHind ? colors.primary : colors.dark1));
+                    legGroup.add(ball(0.040, colors.light, fem1.x, fem1.y, fem1.z)); // knee
+                    legGroup.add(tube(fem1, tib1, isHind ? 0.032 : 0.022, isHind ? colors.primary : colors.dark1));
+                    legGroup.add(tube(tib1, ta1, 0.016, colors.dark1));
+                    legGroup.add(tube(ta1,  ta2, 0.013, colors.primary));
+                    legGroup.add(tube(ta2,  ta3, 0.010, colors.dark1));
+
+                    // Claw pair
+                    [-1, 1].forEach(claw => {
+                        const cl = new THREE.Vector3(ta3.x + claw * 0.035, ta3.y - 0.05, ta3.z + 0.018);
+                        legGroup.add(tube(ta3, cl, 0.006, colors.light));
+                    });
+
+                    // Pollen basket (corbicula) on the hind tibia: a packed
+                    // pollen ball plus a fan of retaining bristles
+                    if (isHind) {
+                        const pb = fem1.clone().lerp(tib1, 0.5);
+                        legGroup.add(ball(0.10, colors.light, pb.x, pb.y, pb.z, 0.6, 1.1, 0.55));
+                        for (let i = 0; i < 5; i++) {
+                            const ang = (i / 5) * Math.PI * 0.8 - 0.2;
+                            const bristleEnd = new THREE.Vector3(
+                                pb.x + Math.cos(ang) * 0.08 * side,
+                                pb.y + Math.sin(ang) * 0.08,
+                                pb.z - 0.08
+                            );
+                            legGroup.add(tube(pb, bristleEnd, 0.004, colors.light));
+                        }
+                    }
+
+                    group.add(legGroup);
+
+                    // Lift axis: horizontal, perpendicular to the leg's spoke
+                    const outward = new THREE.Vector3(oX, 0, oZ).normalize();
+                    const liftAxis = new THREE.Vector3().crossVectors(outward, new THREE.Vector3(0, 1, 0)).normalize();
+
+                    // Tripod phasing, at hover: a slow dangling drift
+                    const phase = ((pi + (side > 0 ? 0 : 1)) % 2) * Math.PI + pi * 0.3;
+
+                    legs.push({ group: legGroup, liftAxis, phase });
+                });
+            });
+
+            group.position.set(0, 0.2, 0.2);
+            group.scale.setScalar(2.0);
+            return group;
+        }
+
+        // ── Pointer interaction: drag to spin, with inertia ──
+        let dragging = false, lastX = 0, spinVel = 0, userSpin = 0;
+
+        function onDown(x) { dragging = true; lastX = x; document.body.classList.add('dragging'); }
+        function onMove(x) {
+            if (!dragging) return;
+            spinVel = (x - lastX) * 0.006;
+            userSpin += spinVel;
+            lastX = x;
+        }
+        function onUp() { dragging = false; document.body.classList.remove('dragging'); }
+
+        window.addEventListener('pointerdown', e => onDown(e.clientX));
+        window.addEventListener('pointermove', e => onMove(e.clientX));
+        window.addEventListener('pointerup', onUp);
+        window.addEventListener('pointercancel', onUp);
+
+        function init() {
+            initBackground();
+            animateBackground();
+            updateSize();
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(colors.dark3);
+
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+            updateCamera();
+
+            bee = createBee();
+            scene.add(bee);
+
+            animate();
+        }
+
+        const _q = new THREE.Quaternion();
+        function animate() {
+            requestAnimationFrame(animate);
+            const t = Date.now();
+
+            if (bee) {
+                // Auto-rotate plus user drag with inertia
+                if (!dragging) {
+                    userSpin += spinVel;
+                    spinVel *= 0.95;
+                }
+                bee.rotation.y = userSpin + t * 0.0004;
+
+                // Heavy hover: a deeper, rounder bob than the mosquito
+                bee.position.y = 0.2 + Math.sin(t * 0.0022) * 0.08;
+                bee.rotation.x = Math.sin(t * 0.0016) * 0.04;
+                bee.rotation.z = Math.sin(t * 0.002 + 0.8) * 0.03;
+
+                // Wing buzz — forewings lead, hindwings trail with smaller
+                // amplitude; both sides mirrored at one frequency
+                for (const w of wings) {
+                    const amp   = w.fore ? 0.60 : 0.45;
+                    const phase = w.fore ? 0 : 0.3;
+                    w.group.rotation.z = w.base.rz - w.side * Math.sin(t * 0.014 + phase) * amp;
+                    w.group.rotation.x = w.base.rx + Math.sin(t * 0.0136 + phase) * (w.fore ? 0.10 : 0.08);
+                }
+
+                // Legs drift slowly at hover — dangling, not stepping
+                for (const leg of legs) {
+                    const lift  = Math.sin(t * 0.0017 + leg.phase) * 0.04;
+                    const swing = Math.sin(t * 0.0017 + leg.phase + Math.PI / 2) * 0.02;
+                    _q.setFromAxisAngle(leg.liftAxis, lift);
+                    leg.group.quaternion.copy(_q);
+                    leg.group.rotateY(swing);
+                }
+
+                // Antennae feeling the air
+                for (const a of antennae) {
+                    a.group.rotation.z = Math.sin(t * 0.0025 + a.side) * 0.07 * a.side;
+                    a.group.rotation.x = Math.sin(t * 0.003) * 0.05;
+                }
+            }
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            updateSize(); initBackground();
+            if (camera) { camera.aspect = window.innerWidth / window.innerHeight; updateCamera(); }
+        });
+
+        window.addEventListener('load', init);
+    </script>
+</body>
+</html>

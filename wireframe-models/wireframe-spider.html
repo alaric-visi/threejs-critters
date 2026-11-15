@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aether — Spider</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; overflow: hidden; height: 100vh; cursor: grab; }
+        body.dragging { cursor: grabbing; }
+        #bgCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+        #animationCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; }
+    </style>
+</head>
+<body>
+    <canvas id="bgCanvas"></canvas>
+    <canvas id="animationCanvas"></canvas>
+
+    <script>
+        const colors = {
+            primary: 0x4db8d4,
+            dark1:   0x0d2a3a,
+            dark3:   0x000000,
+            light:   0xaee8f5
+        };
+
+        // ── THEME SYNC ──
+        function syncTheme() {
+            try {
+                let isDark = true;
+                if (window.parent && window.parent.document) {
+                    isDark = window.parent.document.documentElement.classList.contains('dark');
+                }
+                if (!isDark) {
+                    document.body.style.backgroundColor = '#ffffff';
+                    colors.dark3 = 0xffffff;
+                    colors.dark1 = 0xcccccc;
+                    if (typeof scene !== 'undefined' && scene) {
+                        scene.background = new THREE.Color(colors.dark3);
+                    }
+                } else {
+                    document.body.style.backgroundColor = '#000000';
+                    colors.dark3 = 0x000000;
+                    colors.dark1 = 0x0d2a3a;
+                    if (typeof scene !== 'undefined' && scene) {
+                        scene.background = new THREE.Color(colors.dark3);
+                    }
+                }
+            } catch (e) {}
+        }
+        syncTheme();
+        if (window.parent && window.parent.document) {
+            try {
+                var observer = new MutationObserver(syncTheme);
+                observer.observe(window.parent.document.documentElement, { attributes: true, attributeFilter: ['class'] });
+            } catch(e) {}
+        }
+
+        // ── Background ──
+        const bgCanvas = document.getElementById('bgCanvas');
+        const bgCtx = bgCanvas.getContext('2d');
+        const pixelSize = 8;
+        let cols, rows, pixels = [];
+
+        // Precomputed color ramp so we don't build strings every pixel, every frame
+        const RAMP_STEPS = 48;
+        const ramp = Array.from({ length: RAMP_STEPS + 1 }, (_, i) => {
+            const b = (i / RAMP_STEPS) * 0.4;
+            return `rgb(${Math.floor(b*10)},${Math.floor(b*30)},${Math.floor(b*50)})`;
+        });
+
+        function initBackground() {
+            bgCanvas.width = window.innerWidth;
+            bgCanvas.height = window.innerHeight;
+            cols = Math.ceil(bgCanvas.width / pixelSize);
+            rows = Math.ceil(bgCanvas.height / pixelSize);
+            pixels = [];
+            for (let i = 0; i < cols * rows; i++)
+                pixels.push({ brightness: Math.random() * 0.3, speed: 0.001 + Math.random() * 0.003 });
+        }
+
+        let bgFrame = 0;
+        function animateBackground() {
+            // Half the frame rate is imperceptible here and halves the fill cost
+            if ((bgFrame++ & 1) === 0) {
+                for (let y = 0; y < rows; y++) {
+                    for (let x = 0; x < cols; x++) {
+                        const p = pixels[y * cols + x];
+                        p.brightness += p.speed * 2;
+                        if (p.brightness > 0.4) p.brightness = 0;
+                        bgCtx.fillStyle = ramp[Math.min(RAMP_STEPS, (p.brightness * RAMP_STEPS / 0.4) | 0)];
+                        bgCtx.fillRect(x * pixelSize, y * pixelSize, pixelSize, pixelSize);
+                    }
+                }
+            }
+            requestAnimationFrame(animateBackground);
+        }
+
+        // ── Three.js ──
+        const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('animationCanvas'), antialias: true, alpha: true });
+        let scene, camera, spider;
+        let abdomen, palps = [], legs = [];
+
+        function updateSize() {
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        }
+
+        function updateCamera() {
+            const w = window.innerWidth;
+            if (w < 480)      { camera.position.set(0, 3.0, 3.8); camera.fov = 55; }
+            else if (w < 768) { camera.position.set(0, 2.6, 3.2); camera.fov = 50; }
+            else              { camera.position.set(0, 2.0, 2.6); camera.fov = 45; }
+            
+            camera.lookAt(0, 0, 0);
+            camera.updateProjectionMatrix();
+        }
+
+        // Wireframe MeshBasicMaterial ignores lights, so materials can be
+        // shared freely — one per color instead of one per mesh.
+        const matCache = new Map();
+        function mat(color) {
+            if (!matCache.has(color))
+                matCache.set(color, new THREE.MeshBasicMaterial({ color, wireframe: true }));
+            return matCache.get(color);
+        }
+
+        function tube(p0, p1, radius, color, mid) {
+            const pts = mid ? [p0, mid, p1] : [p0, p1];
+            const curve = new THREE.CatmullRomCurve3(pts);
+            return new THREE.Mesh(new THREE.TubeGeometry(curve, 8, radius, 6, false), mat(color));
+        }
+
+        function ball(r, color, x, y, z, sx=1, sy=1, sz=1) {
+            const m = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 20), mat(color));
+            m.position.set(x, y, z);
+            m.scale.set(sx, sy, sz);
+            return m;
+        }
+
+        function createSpider() {
+            const g = new THREE.Group();
+
+            // ── ABDOMEN ── large ovoid, rear section (kept as a reference for breathing)
+            abdomen = ball(0.72, colors.primary,  0, 0.05, -0.95,  0.88, 0.76, 1.22);
+            g.add(abdomen);
+
+            // Dorsal chevron markings
+            for (let i = 0; i < 3; i++) {
+                const z = -0.72 - i * 0.28;
+                const w = 0.32 - i * 0.07;
+                [-1,1].forEach(s => {
+                    const mk = new THREE.Mesh(new THREE.SphereGeometry(0.1, 10, 10), mat(colors.dark1));
+                    mk.position.set(s * w * 0.55, 0.48, z);
+                    mk.scale.set(0.5, 0.22, 0.7);
+                    g.add(mk);
+                });
+            }
+
+            // Spinnerets
+            [-1,1].forEach(s => {
+                const sp = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.03, 0.12, 8), mat(colors.light));
+                sp.position.set(s * 0.07, -0.08, -1.74);
+                sp.rotation.x = Math.PI * 0.38;
+                g.add(sp);
+            });
+
+            // ── PEDICEL ── narrow waist
+            const pedCurve = new THREE.CatmullRomCurve3([
+                new THREE.Vector3(0, 0.02, -0.28),
+                new THREE.Vector3(0, 0.05, -0.08),
+                new THREE.Vector3(0, 0.02,  0.1),
+            ]);
+            g.add(new THREE.Mesh(new THREE.TubeGeometry(pedCurve, 8, 0.068, 8, false), mat(colors.dark1)));
+
+            // ── CEPHALOTHORAX ── forward section, slightly raised
+            g.add(ball(0.48, colors.primary,  0, 0.06, 0.4,  0.95, 0.7, 1.12));
+
+            // Carapace ridge line
+            const ridgeCurve = new THREE.CatmullRomCurve3([
+                new THREE.Vector3(0, 0.37, 0.68),
+                new THREE.Vector3(0, 0.40, 0.38),
+                new THREE.Vector3(0, 0.34, 0.08),
+            ]);
+            g.add(new THREE.Mesh(new THREE.TubeGeometry(ridgeCurve, 8, 0.02, 6, false), mat(colors.light)));
+
+            // Fovea diamond
+            const fov = new THREE.Mesh(new THREE.OctahedronGeometry(0.065, 0), mat(colors.light));
+            fov.position.set(0, 0.38, 0.28); fov.scale.set(0.8, 0.35, 1.1);
+            g.add(fov);
+
+            // ── EYES ── 8 eyes on front face
+            const eyeDefs = [
+                [-0.09, 0.28, 0.84, 0.056],  // AME L (large)
+                [ 0.09, 0.28, 0.84, 0.056],  // AME R (large)
+                [-0.23, 0.21, 0.77, 0.036],  // ALE L
+                [ 0.23, 0.21, 0.77, 0.036],  // ALE R
+                [-0.12, 0.36, 0.66, 0.030],  // PME L
+                [ 0.12, 0.36, 0.66, 0.030],  // PME R
+                [-0.26, 0.30, 0.60, 0.026],  // PLE L
+                [ 0.26, 0.30, 0.60, 0.026],  // PLE R
+            ];
+            eyeDefs.forEach(([x,y,z,r], i) => {
+                g.add(ball(r, i < 2 ? colors.light : colors.primary, x, y, z));
+            });
+
+            // ── CHELICERAE ──
+            [-1,1].forEach(s => {
+                const c0 = new THREE.Vector3(s*0.11, 0.1,  0.83);
+                const c1 = new THREE.Vector3(s*0.12, -0.05, 0.90);
+                const c2 = new THREE.Vector3(s*0.11, -0.18, 0.86);
+                g.add(tube(c0, c1, 0.052, colors.dark1));
+                g.add(tube(c1, c2, 0.024, colors.light));
+            });
+
+            // ── PEDIPALPS ── built as pivoting groups so they can feel
+            [-1,1].forEach(s => {
+                const pivot = new THREE.Vector3(s*0.21, 0.1, 0.75);
+                const grp = new THREE.Group();
+                grp.position.copy(pivot);
+
+                const p1 = new THREE.Vector3(s*0.34, 0.03, 0.86).sub(pivot);
+                const p2 = new THREE.Vector3(s*0.44,-0.04, 0.96).sub(pivot);
+                const curve = new THREE.CatmullRomCurve3([new THREE.Vector3(), p1, p2]);
+                grp.add(new THREE.Mesh(new THREE.TubeGeometry(curve, 6, 0.018, 6, false), mat(colors.primary)));
+                grp.add(ball(0.036, colors.light, p2.x, p2.y, p2.z));
+
+                g.add(grp);
+                palps.push({ group: grp, side: s });
+            });
+
+            // ── LEGS ──
+            // Each leg is its own Group pivoted at the body attachment point,
+            // so the whole limb can be lifted/swung for an idle stepping ripple.
+            // fanAngle is measured from +Z (forward): <90° sweeps forward,
+            // >90° sweeps back. Angles increase front-to-back so each leg
+            // stays inside its own angular sector and none can cross.
+            const pairs = [
+                { attachZ: 0.60, fanAngle: Math.PI * 0.20 }, // pair 1 — sweeps forward
+                { attachZ: 0.42, fanAngle: Math.PI * 0.38 }, // pair 2 — forward-side
+                { attachZ: 0.26, fanAngle: Math.PI * 0.62 }, // pair 3 — back-side
+                { attachZ: 0.10, fanAngle: Math.PI * 0.80 }, // pair 4 — sweeps back
+            ];
+
+            pairs.forEach((pair, pi) => {
+                [-1, 1].forEach(side => {
+                    const fa = pair.fanAngle;
+
+                    // Outward unit vector in the XZ plane for this leg.
+                    // +cos here is the crucial sign: front-attached legs get a
+                    // forward Z component, rear-attached legs a backward one.
+                    const outX = side * Math.sin(fa);
+                    const outZ = Math.cos(fa);
+
+                    const legGroup = new THREE.Group();
+                    const origin = new THREE.Vector3(side * 0.40, 0.0, pair.attachZ);
+                    legGroup.position.copy(origin);
+
+                    // Segment endpoints, relative to the attachment point.
+                    // The coxa is radial — it leaves the body along the leg's
+                    // own outward spoke instead of straight sideways.
+                    const cox1 = new THREE.Vector3(outX * 0.24, 0.02, outZ * 0.24);
+                    const femLen = 0.80;
+                    const fem1 = new THREE.Vector3(
+                        cox1.x + outX * femLen * 0.85,
+                        cox1.y + 0.24,
+                        cox1.z + outZ * femLen * 0.45
+                    );
+                    const tibLen = 0.78;
+                    const tib1 = new THREE.Vector3(
+                        fem1.x + outX * tibLen * 0.7,
+                        fem1.y - 0.52,
+                        fem1.z + outZ * tibLen * 0.35
+                    );
+                    const metLen = 0.55;
+                    const met1 = new THREE.Vector3(
+                        tib1.x + outX * metLen * 0.5,
+                        tib1.y - 0.40,
+                        tib1.z + outZ * metLen * 0.25
+                    );
+                    const tarLen = 0.28;
+                    const tar1 = new THREE.Vector3(
+                        met1.x + outX * tarLen * 0.4,
+                        met1.y - 0.22,
+                        met1.z + outZ * tarLen * 0.2
+                    );
+
+                    legGroup.add(tube(new THREE.Vector3(), cox1, 0.030, colors.dark1)); // coxa
+                    legGroup.add(ball(0.038, colors.light, cox1.x, cox1.y, cox1.z));    // trochanter
+                    legGroup.add(tube(cox1, fem1, 0.026, colors.primary));              // femur
+                    legGroup.add(ball(0.044, colors.light, fem1.x, fem1.y, fem1.z));    // knee
+                    legGroup.add(tube(fem1, tib1, 0.020, colors.primary));              // tibia
+                    legGroup.add(tube(tib1, met1, 0.014, colors.dark1));                // metatarsus
+                    legGroup.add(tube(met1, tar1, 0.009, colors.dark1));                // tarsus
+
+                    [-1,1].forEach(claw => {
+                        const cl = new THREE.Vector3(tar1.x + claw * 0.04, tar1.y - 0.055, tar1.z + 0.02);
+                        legGroup.add(tube(tar1, cl, 0.006, colors.light));
+                    });
+
+                    g.add(legGroup);
+
+                    // Lift axis: horizontal, perpendicular to the leg's outward direction
+                    const outward = new THREE.Vector3(outX, 0, outZ).normalize();
+                    const liftAxis = new THREE.Vector3().crossVectors(outward, new THREE.Vector3(0, 1, 0)).normalize();
+
+                    // Alternating-tetrapod phasing: adjacent legs move out of step,
+                    // mirrored legs move out of step — the natural spider gait pattern.
+                    const phase = ((pi + (side > 0 ? 0 : 1)) % 2) * Math.PI + pi * 0.35;
+
+                    legs.push({ group: legGroup, liftAxis, phase });
+                });
+            });
+
+            return g;
+        }
+
+        // ── Pointer interaction: drag to spin, with inertia ──
+        let dragging = false, lastX = 0, spinVel = 0, userSpin = 0;
+
+        function onDown(x) { dragging = true; lastX = x; document.body.classList.add('dragging'); }
+        function onMove(x) {
+            if (!dragging) return;
+            spinVel = (x - lastX) * 0.006;
+            userSpin += spinVel;
+            lastX = x;
+        }
+        function onUp() { dragging = false; document.body.classList.remove('dragging'); }
+
+        window.addEventListener('pointerdown', e => onDown(e.clientX));
+        window.addEventListener('pointermove', e => onMove(e.clientX));
+        window.addEventListener('pointerup', onUp);
+        window.addEventListener('pointercancel', onUp);
+
+        function init() {
+            initBackground();
+            animateBackground();
+            updateSize();
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(colors.dark3);
+
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+            updateCamera();
+
+            spider = createSpider();
+            scene.add(spider);
+
+            animate();
+        }
+
+        const _q = new THREE.Quaternion();
+        function animate() {
+            requestAnimationFrame(animate);
+            const t = Date.now();
+
+            if (spider) {
+                // Auto-rotate plus user drag with inertia
+                if (!dragging) {
+                    userSpin += spinVel;
+                    spinVel *= 0.95;                       // inertia decay
+                }
+                spider.rotation.y = userSpin + t * 0.0003;
+
+                // Body drift
+                spider.position.y = Math.sin(t * 0.0012) * 0.06;
+                spider.rotation.x = Math.sin(t * 0.0008) * 0.03;
+                spider.rotation.z = Math.sin(t * 0.0015) * 0.01;
+
+                // Abdomen breathing
+                const br = 1 + Math.sin(t * 0.0021) * 0.02;
+                abdomen.scale.set(0.88 * br, 0.76 * br, 1.22);
+
+                // Idle stepping ripple across the legs
+                for (const leg of legs) {
+                    const lift  = Math.sin(t * 0.0035 + leg.phase) * 0.05;
+                    const swing = Math.sin(t * 0.0035 + leg.phase + Math.PI / 2) * 0.028;
+                    _q.setFromAxisAngle(leg.liftAxis, lift);
+                    leg.group.quaternion.copy(_q);
+                    leg.group.rotateY(swing);
+                }
+
+                // Pedipalps feeling the air
+                for (const palp of palps) {
+                    palp.group.rotation.y = Math.sin(t * 0.0028 + palp.side) * 0.1 * palp.side;
+                    palp.group.rotation.x = Math.sin(t * 0.0033) * 0.06;
+                }
+            }
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            updateSize(); initBackground();
+            if (camera) { camera.aspect = window.innerWidth / window.innerHeight; updateCamera(); }
+        });
+
+        window.addEventListener('load', init);
+    </script>
+</body>
+</html>

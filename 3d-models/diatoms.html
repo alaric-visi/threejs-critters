@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Diatoms</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #000; overflow: hidden; height: 100%; }
+  #bgCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 1; }
+  #animationCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 2; cursor: grab; touch-action: none; }
+  #animationCanvas:active { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="bgCanvas"></canvas>
+<canvas id="animationCanvas"></canvas>
+
+<script>
+const TAU = Math.PI*2;
+const rand = (a,b)=> a + Math.random()*(b-a);
+
+const bgCanvas = document.getElementById('bgCanvas');
+const bgCtx = bgCanvas.getContext('2d');
+function initBackground(){
+  bgCanvas.width = innerWidth; bgCanvas.height = innerHeight;
+  bgCtx.fillStyle = '#000';
+  bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+}
+
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('animationCanvas'), antialias:true, alpha:true });
+let scene, camera, colony, rosetteOuter, rosetteInner;
+const iriMats = [];
+const armParts = [];
+const satellites = [];
+const wavers = [];
+let hueShift = 0, colonyBaseScale = 0.8;
+
+function updateSize(){
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+}
+
+const cam = { dist: 4.5, yaw: 0.5, pitch: 0.22, targetYaw: 0.5, targetPitch: 0.22, targetDist: 4.5, autoYaw: 0 };
+function updateCamera(){
+  const w = innerWidth;
+  if (w < 480){ cam.targetDist = Math.min(Math.max(cam.targetDist, 12), 18); camera.fov = 60; }
+  else if (w < 768){ camera.fov = 54; }
+  else { camera.fov = 47; }
+  camera.updateProjectionMatrix();
+}
+function applyCamera(){
+  cam.yaw   += (cam.targetYaw   - cam.yaw)   * 0.08;
+  cam.pitch += (cam.targetPitch - cam.pitch) * 0.08;
+  cam.dist  += (cam.targetDist  - cam.dist)  * 0.08;
+  const total = cam.yaw + cam.autoYaw;
+  const p = Math.max(-1.35, Math.min(1.35, cam.pitch));
+  camera.position.set(
+    Math.sin(total)*Math.cos(p)*cam.dist,
+    Math.sin(p)*cam.dist,
+    Math.cos(total)*Math.cos(p)*cam.dist
+  );
+  camera.lookAt(0, 0, 0);
+}
+
+function iri(offset, opts={}){
+  const { sat=0.85, light=0.58, roughness=0.14, metalness=0.85, opacity=1, transparent=false } = opts;
+  const m = new THREE.MeshStandardMaterial({ color:0xffffff, roughness, metalness, side:THREE.DoubleSide, transparent, opacity });
+  m.userData = { offset, sat, light };
+  m.color.setHSL(((offset%1)+1)%1, sat, light);
+  iriMats.push(m);
+  return m;
+}
+
+function makePennateCell(len, w, hue, nStria=8){
+  const cell = new THREE.Group();
+  const glass = iri(hue,      { opacity:0.5,  transparent:true, roughness:0.12, metalness:0.9, light:0.6 });
+  const ribM  = iri(hue+0.06, { opacity:0.92, transparent:true, roughness:0.25, metalness:0.7, light:0.72 });
+  const hw = w/2, d = w*0.42;
+  const sh = new THREE.Shape();
+  sh.moveTo(-len/2, 0);
+  sh.bezierCurveTo(-len*0.28, hw, len*0.28, hw, len/2, 0);
+  sh.bezierCurveTo( len*0.28,-hw,-len*0.28,-hw,-len/2, 0);
+  const geo = new THREE.ExtrudeGeometry(sh, { depth:d, bevelEnabled:true, bevelThickness:d*0.3, bevelSize:d*0.3, bevelSegments:2, steps:1, curveSegments:8 });
+  geo.translate(0, 0, -d/2 - d*0.3);
+  cell.add(new THREE.Mesh(geo, glass));
+  const raphe = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, len*0.9, 6), ribM);
+  raphe.rotation.z = Math.PI/2; cell.add(raphe);
+  cell.add(new THREE.Mesh(new THREE.SphereGeometry(w*0.18, 8, 8), ribM));
+  [-1,1].forEach(sx=>{ const n = new THREE.Mesh(new THREE.SphereGeometry(w*0.12, 6, 6), ribM); n.position.x = sx*len*0.44; cell.add(n); });
+  for (let i=1;i<nStria;i++){
+    const x = -len/2 + (i/nStria)*len;
+    const hh = hw*Math.sqrt(Math.max(0,1-Math.pow(2*x/len,2)))*0.82;
+    if (hh < 0.02) continue;
+    const rib = new THREE.Mesh(new THREE.BoxGeometry(0.012, hh*2, d*1.2), ribM);
+    rib.position.x = x; cell.add(rib);
+  }
+  return cell;
+}
+
+function makeCentricCell(R, H, hue, opts={}){
+  const spokes = opts.spokes ?? 14, rings = opts.rings ?? 3, poreRings = opts.pores ?? 2;
+  const cell = new THREE.Group();
+  const glass = iri(hue,      { opacity:0.42, transparent:true, roughness:0.1, metalness:0.9, light:0.6 });
+  const line  = iri(hue+0.05, { opacity:0.92, transparent:true, roughness:0.2, metalness:0.75, light:0.72 });
+  const drum = new THREE.Mesh(new THREE.CylinderGeometry(R, R, H, 36, 1, true), glass);
+  drum.rotation.x = Math.PI/2; cell.add(drum);
+  [-1,1].forEach(s=>{ const b = new THREE.Mesh(new THREE.TorusGeometry(R, H*0.07, 6, 36), line); b.position.z = s*H*0.28; cell.add(b); });
+  [-1,1].forEach(sz=>{
+    const zf = sz*H/2;
+    const face = new THREE.Mesh(new THREE.CircleGeometry(R, 36), glass);
+    face.position.z = zf; if (sz<0) face.rotation.y = Math.PI; cell.add(face);
+    for (let k=1;k<=rings;k++){ const ring = new THREE.Mesh(new THREE.TorusGeometry(R*k/(rings+0.3), R*0.014, 5, 36), line); ring.position.z = zf + sz*0.004; cell.add(ring); }
+    for (let i=0;i<spokes;i++){ const a = i/spokes*TAU; const rib = new THREE.Mesh(new THREE.BoxGeometry(R*0.9, R*0.022, R*0.012), line); rib.position.set(Math.cos(a)*R*0.46, Math.sin(a)*R*0.46, zf + sz*0.005); rib.rotation.z = a; cell.add(rib); }
+    for (let k=1;k<=poreRings;k++){ const rr = R*(k+0.35)/(poreRings+1.1), n = 8 + k*8; for (let i=0;i<n;i++){ const a = i/n*TAU + k*0.3; const p = new THREE.Mesh(new THREE.SphereGeometry(R*0.03, 5, 5), line); p.position.set(Math.cos(a)*rr, Math.sin(a)*rr, zf + sz*0.008); cell.add(p); } }
+    const c = new THREE.Mesh(new THREE.SphereGeometry(R*0.09, 8, 8), line); c.position.z = zf + sz*0.01; cell.add(c);
+  });
+  return cell;
+}
+
+function makeTriangleCell(R, H, hue){
+  const cell = new THREE.Group();
+  const glass = iri(hue,      { opacity:0.45, transparent:true, roughness:0.1, metalness:0.9, light:0.6 });
+  const line  = iri(hue+0.05, { opacity:0.92, transparent:true, roughness:0.2, metalness:0.75, light:0.72 });
+  const prism = new THREE.Mesh(new THREE.CylinderGeometry(R, R, H, 3, 1, false), glass);
+  prism.rotation.x = Math.PI/2; prism.rotation.z = Math.PI/6; cell.add(prism);
+  for (let i=0;i<3;i++){
+    const a = i/3*TAU + Math.PI/6;
+    const corner = new THREE.Mesh(new THREE.SphereGeometry(R*0.13, 8, 8), line);
+    corner.position.set(Math.cos(a)*R, Math.sin(a)*R, 0); cell.add(corner);
+    [-1,1].forEach(sz=>{ const rib = new THREE.Mesh(new THREE.BoxGeometry(R*0.85, R*0.02, R*0.01), line); rib.position.set(Math.cos(a)*R*0.5, Math.sin(a)*R*0.5, sz*H/2); rib.rotation.z = a; cell.add(rib); });
+  }
+  [-1,1].forEach(sz=>{ for (let e=0;e<3;e++){ const a0=e/3*TAU+Math.PI/6, a1=((e+1)%3)/3*TAU+Math.PI/6; for (let k=1;k<4;k++){ const tt=k/4; const p = new THREE.Mesh(new THREE.SphereGeometry(R*0.04, 5, 5), line); p.position.set((Math.cos(a0)*(1-tt)+Math.cos(a1)*tt)*R*0.9, (Math.sin(a0)*(1-tt)+Math.sin(a1)*tt)*R*0.9, sz*H/2*1.02); cell.add(p); } } });
+  cell.add(new THREE.Mesh(new THREE.SphereGeometry(R*0.1, 8, 8), line));
+  return cell;
+}
+
+function makeRodCell(len, r, hue, nRing=9){
+  const cell = new THREE.Group();
+  const glass = iri(hue,      { opacity:0.5, transparent:true, roughness:0.12, metalness:0.9, light:0.6 });
+  const line  = iri(hue+0.06, { opacity:0.9, transparent:true, roughness:0.2, metalness:0.7, light:0.72 });
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len*0.9, 8), glass); body.rotation.z = Math.PI/2; cell.add(body);
+  [-1,1].forEach(sx=>{ const tip = new THREE.Mesh(new THREE.ConeGeometry(r, len*0.12, 8), glass); tip.position.x = sx*len*0.48; tip.rotation.z = sx>0 ? -Math.PI/2 : Math.PI/2; cell.add(tip); });
+  const raphe = new THREE.Mesh(new THREE.CylinderGeometry(r*0.16, r*0.16, len*0.85, 4), line); raphe.rotation.z = Math.PI/2; cell.add(raphe);
+  for (let i=1;i<nRing;i++){ const ring = new THREE.Mesh(new THREE.TorusGeometry(r*1.05, r*0.14, 4, 10), line); ring.position.x = -len*0.42 + (i/nRing)*len*0.84; ring.rotation.y = Math.PI/2; cell.add(ring); }
+  return cell;
+}
+
+function makeChain(nCells, R, hue){
+  const group = new THREE.Group(); const cells = [];
+  const gap = R*0.22;
+  for (let i=0;i<nCells;i++){
+    const holder = new THREE.Group();
+    const c = makeCentricCell(R, R*0.8, hue + i*0.05, { spokes:8, rings:1, pores:0 });
+    c.rotation.y = Math.PI/2; holder.add(c);
+    holder.position.x = (i-(nCells-1)/2)*(R*0.8+gap);
+    holder.userData.base = 0;
+    group.add(holder); cells.push(holder);
+  }
+  return { group, cells };
+}
+function makeZigzag(nCells, len, hue){
+  const group = new THREE.Group(); const cells = [];
+  let x = -(nCells-1)*len*0.42;
+  for (let i=0;i<nCells;i++){
+    const holder = new THREE.Group();
+    holder.add(makePennateCell(len, len*0.16, hue + i*0.05, 6));
+    holder.position.x = x;
+    holder.userData.base = (i%2 ? 1 : -1) * 0.55;
+    holder.rotation.z = holder.userData.base;
+    group.add(holder); cells.push(holder);
+    x += len*0.84;
+  }
+  return { group, cells };
+}
+function makeFan(nCells, hue){
+  const group = new THREE.Group(); const cells = [];
+  const spread = 1.7, len = 1.0;
+  for (let i=0;i<nCells;i++){
+    const frac = nCells>1 ? i/(nCells-1) : 0.5;
+    const holder = new THREE.Group();
+    const c = makePennateCell(len, 0.1, hue + i*0.04, 6);
+    c.position.x = len/2 + 0.08; holder.add(c);
+    holder.userData.base = (frac-0.5)*spread;
+    holder.rotation.z = holder.userData.base;
+    group.add(holder); cells.push(holder);
+  }
+  group.add(new THREE.Mesh(new THREE.SphereGeometry(0.11, 8, 8), iri(hue, { opacity:0.6, transparent:true, light:0.6 })));
+  return { group, cells };
+}
+function makeRibbon(nCells, hue){
+  const group = new THREE.Group(); const cells = [];
+  const len = 1.05;
+  for (let i=0;i<nCells;i++){
+    const holder = new THREE.Group();
+    holder.add(makePennateCell(len, 0.12, hue + i*0.05, 7));
+    holder.position.z = (i-(nCells-1)/2)*0.17;
+    holder.userData.base = 0;
+    group.add(holder); cells.push(holder);
+  }
+  return { group, cells };
+}
+
+function addSatellite(inner, o){
+  const plane = new THREE.Group();
+  plane.rotation.x = o.incl || 0;
+  plane.rotation.z = o.tilt || 0;
+  colony.add(plane);
+  const orbiter = new THREE.Group();
+  orbiter.add(inner);
+  plane.add(orbiter);
+  satellites.push({
+    plane, orbiter, inner,
+    R:o.R, speed:o.speed, phase:o.phase||0,
+    node:o.node||0, nodeSpeed:o.nodeSpeed||0,
+    wobble:o.wobble||0.3, ratio:o.ratio||1.3,
+    spin:o.spin||{ x:rand(-0.006,0.006), y:rand(-0.006,0.006), z:rand(-0.004,0.004) },
+    pulse:o.pulse||{ amp:rand(0.02,0.06), speed:rand(0.6,1.4), phase:rand(0,TAU) }
+  });
+  return orbiter;
+}
+
+function buildRosette(group, nArm, armLen, w, twist, hue0){
+  for (let i=0;i<nArm;i++){
+    const a = i/nArm*TAU;
+    const arm = new THREE.Group(); arm.rotation.z = a;
+    const cell = makePennateCell(armLen, w, (hue0 + i/nArm)%1, 9);
+    cell.position.x = armLen/2 + 0.15; cell.rotation.z = twist;
+    arm.add(cell); group.add(arm);
+    armParts.push({ group:arm, base:a, cell, baseTwist:twist });
+  }
+}
+
+function createColony(){
+  colony = new THREE.Group();
+
+  rosetteOuter = new THREE.Group(); colony.add(rosetteOuter);
+  buildRosette(rosetteOuter, 10, 1.7, 0.15, 0.30, 0.0);
+  rosetteInner = new THREE.Group(); colony.add(rosetteInner);
+  buildRosette(rosetteInner, 7, 0.95, 0.12, -0.32, 0.45);
+  const hub = new THREE.Mesh(new THREE.SphereGeometry(0.3, 20, 18), iri(0.0, { opacity:0.5, transparent:true, roughness:0.1, metalness:0.9, light:0.62 }));
+  colony.add(hub);
+  colony.add(new THREE.Mesh(new THREE.TorusGeometry(0.37, 0.03, 8, 30), iri(0.06, { opacity:0.9, transparent:true, light:0.72 })));
+
+  for (let i=0;i<6;i++){
+    addSatellite(makeTriangleCell(rand(0.4,0.6), 0.28, i/6), {
+      R:2.15, speed:0.14, phase:i/6*TAU, incl:0.25, node:0.3, nodeSpeed:0.05 });
+  }
+
+  for (let i=0;i<5;i++){
+    addSatellite(makeCentricCell(rand(0.45,0.75), rand(0.26,0.36), i/5+0.1, { spokes:12, rings:2, pores:1 }), {
+      R:2.75, speed:-0.1, phase:i/5*TAU, incl:0.75, node:1.2, nodeSpeed:-0.04 });
+  }
+
+  const cShapes = [ makeChain(4,0.32,0.30), makeChain(3,0.40,0.62), makeZigzag(6,0.7,0.85), makeZigzag(5,0.6,0.15), makeChain(5,0.28,0.5) ];
+  cShapes.forEach((s,i)=>{
+    addSatellite(s.group, { R:3.15, speed:0.09, phase:i/cShapes.length*TAU, incl:1.15, node:2.0, nodeSpeed:0.06 });
+    wavers.push({ cells:s.cells, speed:rand(1.6,2.4), amp:rand(0.1,0.2), step:0.7 });
+  });
+
+  addSatellite(makeRodCell(2.4,0.05,0.2),  { R:3.55, speed:0.06, phase:0.0, incl:1.4, node:0.5, nodeSpeed:-0.05 });
+  addSatellite(makeRodCell(2.0,0.05,0.55), { R:3.55, speed:0.06, phase:TAU*0.3, incl:1.4, node:0.5, nodeSpeed:-0.05 });
+  addSatellite(makeRodCell(2.8,0.045,0.8), { R:3.7, speed:0.05, phase:TAU*0.6, incl:1.55, node:1.7, nodeSpeed:0.05 });
+  const fanA = makeFan(6,0.4), fanB = makeFan(7,0.72);
+  addSatellite(fanA.group, { R:3.45, speed:0.07, phase:TAU*0.45, incl:1.25, node:2.6, nodeSpeed:0.04 });
+  addSatellite(fanB.group, { R:3.6, speed:0.06, phase:TAU*0.8, incl:1.3, node:0.9, nodeSpeed:-0.04 });
+  wavers.push({ cells:fanA.cells, speed:1.3, amp:0.12, step:0.5 });
+  wavers.push({ cells:fanB.cells, speed:1.1, amp:0.1, step:0.5 });
+  const rib = makeRibbon(5,0.6);
+  addSatellite(rib.group, { R:3.4, speed:-0.07, phase:TAU*0.15, incl:1.5, node:2.2, nodeSpeed:0.05 });
+
+  for (let i=0;i<16;i++){
+    const hue = Math.random();
+    const k = i%4;
+    const cell = k===0 ? makePennateCell(rand(0.4,0.7),0.09,hue,5)
+               : k===1 ? makeRodCell(rand(0.5,0.9),0.035,hue,6)
+               : k===2 ? makeCentricCell(rand(0.16,0.26),rand(0.1,0.16),hue,{spokes:8,rings:1,pores:0})
+               :         makeTriangleCell(rand(0.16,0.24),0.12,hue);
+    addSatellite(cell, {
+      R:rand(2.3,4.1), speed:rand(-0.13,0.13), phase:Math.random()*TAU,
+      incl:rand(0,Math.PI), node:Math.random()*TAU, nodeSpeed:rand(-0.06,0.06),
+      wobble:rand(0.2,0.7), ratio:rand(0.8,1.8) });
+  }
+
+  colony.scale.setScalar(colonyBaseScale);
+  return colony;
+}
+
+function init(){
+  initBackground(); updateSize();
+  scene = new THREE.Scene();
+  scene.background = null;
+  scene.fog = new THREE.FogExp2(0x000000, 0.012);
+  camera = new THREE.PerspectiveCamera(47, innerWidth/innerHeight, 0.1, 1000);
+  updateCamera();
+  scene.add(createColony());
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x101018, 0.7));
+  const key  = new THREE.DirectionalLight(0xffffff, 1.2); key.position.set(4,7,6); scene.add(key);
+  const rim  = new THREE.PointLight(0x33ccff, 1.5, 90); rim.position.set(-8,3,-4); scene.add(rim);
+  const rim2 = new THREE.PointLight(0xff33aa, 1.3, 90); rim2.position.set(8,-2,-3); scene.add(rim2);
+  const back = new THREE.PointLight(0x99ffcc, 0.7, 90); back.position.set(0,-5,7); scene.add(back);
+  const glint= new THREE.PointLight(0xffffff, 1.0, 70); glint.position.set(2,6,10); scene.add(glint);
+
+  addPointerControls();
+  animate();
+}
+
+function animate(){
+  requestAnimationFrame(animate);
+  const t = performance.now() * 0.001;
+
+  hueShift = (t * 0.05) % 1;
+  for (let i=0;i<iriMats.length;i++){ const m = iriMats[i]; m.color.setHSL((hueShift + m.userData.offset) % 1, m.userData.sat, m.userData.light); }
+
+  if (colony){
+    colony.rotation.y = t*0.07;
+    colony.rotation.x = 0.12 + Math.sin(t*0.23)*0.16;
+    colony.rotation.z = Math.sin(t*0.17)*0.12;
+    colony.position.y = Math.sin(t*0.4)*0.14;
+    colony.position.x = Math.cos(t*0.31)*0.1;
+    const bloom = colonyBaseScale * (1 + Math.sin(t*0.3)*0.05);
+    colony.scale.setScalar(bloom);
+  }
+
+  if (rosetteOuter) rosetteOuter.rotation.z =  t*0.13;
+  if (rosetteInner) rosetteInner.rotation.z = -t*0.19;
+  for (let i=0;i<armParts.length;i++){
+    const ap = armParts[i];
+    ap.group.rotation.z = ap.base + Math.sin(t*0.8 + i*0.5)*0.05;
+    ap.cell.rotation.z  = ap.baseTwist + Math.sin(t*0.6 + i)*0.06;
+  }
+
+  for (let i=0;i<satellites.length;i++){
+    const s = satellites[i];
+    s.plane.rotation.y = s.node + t*s.nodeSpeed;
+    const a = t*s.speed + s.phase;
+    s.orbiter.position.set(Math.cos(a)*s.R, Math.sin(a*s.ratio)*s.wobble, Math.sin(a)*s.R);
+    s.inner.rotation.x += s.spin.x;
+    s.inner.rotation.y += s.spin.y;
+    s.inner.rotation.z += s.spin.z;
+    const p = 1 + Math.sin(t*s.pulse.speed + s.pulse.phase)*s.pulse.amp;
+    s.inner.scale.setScalar(p);
+  }
+
+  for (let i=0;i<wavers.length;i++){
+    const w = wavers[i];
+    for (let j=0;j<w.cells.length;j++){
+      const c = w.cells[j];
+      c.rotation.z = (c.userData.base||0) + Math.sin(t*w.speed - j*w.step)*w.amp;
+    }
+  }
+
+  if (!dragging) cam.autoYaw += 0.0016;
+  applyCamera();
+  renderer.render(scene, camera);
+}
+
+let dragging=false, lastX=0, lastY=0, pinchD=0;
+function addPointerControls(){
+  const c = renderer.domElement;
+  c.addEventListener('pointerdown', e=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; c.setPointerCapture(e.pointerId); });
+  c.addEventListener('pointermove', e=>{ if(!dragging) return; cam.targetYaw += (e.clientX-lastX)*0.006; cam.targetPitch += (e.clientY-lastY)*0.006; lastX=e.clientX; lastY=e.clientY; });
+  const stop=()=>dragging=false;
+  c.addEventListener('pointerup', stop);
+  c.addEventListener('pointercancel', stop);
+  c.addEventListener('pointerleave', stop);
+  c.addEventListener('wheel', e=>{ e.preventDefault(); cam.targetDist = Math.max(4.5, Math.min(20, cam.targetDist + e.deltaY*0.01)); }, {passive:false});
+  c.addEventListener('touchmove', e=>{ if(e.touches.length===2){ const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY; const d=Math.hypot(dx,dy); if(pinchD) cam.targetDist = Math.max(4.5, Math.min(20, cam.targetDist + (pinchD-d)*0.02)); pinchD=d; } }, {passive:true});
+  c.addEventListener('touchend', ()=>pinchD=0);
+}
+
+addEventListener('resize', ()=>{ updateSize(); initBackground(); if(camera){ camera.aspect = innerWidth/innerHeight; updateCamera(); } });
+addEventListener('load', init);
+</script>
+</body>
+</html>

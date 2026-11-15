@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aether — Scorpion</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; overflow: hidden; height: 100vh; cursor: grab; }
+        body.dragging { cursor: grabbing; }
+        #bgCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+        #animationCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; }
+    </style>
+</head>
+<body>
+    <canvas id="bgCanvas"></canvas>
+    <canvas id="animationCanvas"></canvas>
+
+    <script>
+        const colors = {
+            primary: 0x4db8d4,
+            dark1:   0x0d2a3a,
+            dark3:   0x000000,
+            light:   0xaee8f5
+        };
+
+        // ── THEME SYNC ──
+        function syncTheme() {
+            try {
+                let isDark = true;
+                if (window.parent && window.parent.document) {
+                    isDark = window.parent.document.documentElement.classList.contains('dark');
+                }
+                if (!isDark) {
+                    document.body.style.backgroundColor = '#ffffff';
+                    colors.dark3 = 0xffffff;
+                    colors.dark1 = 0xcccccc;
+                    if (typeof scene !== 'undefined' && scene) {
+                        scene.background = new THREE.Color(colors.dark3);
+                    }
+                } else {
+                    document.body.style.backgroundColor = '#000000';
+                    colors.dark3 = 0x000000;
+                    colors.dark1 = 0x0d2a3a;
+                    if (typeof scene !== 'undefined' && scene) {
+                        scene.background = new THREE.Color(colors.dark3);
+                    }
+                }
+            } catch (e) {}
+        }
+        syncTheme();
+        if (window.parent && window.parent.document) {
+            try {
+                var observer = new MutationObserver(syncTheme);
+                observer.observe(window.parent.document.documentElement, { attributes: true, attributeFilter: ['class'] });
+            } catch(e) {}
+        }
+
+        // ── Background ──
+        const bgCanvas = document.getElementById('bgCanvas');
+        const bgCtx = bgCanvas.getContext('2d');
+        const pixelSize = 8;
+        let cols, rows, pixels = [];
+
+        // Precomputed color ramp so we don't build strings every pixel, every frame
+        const RAMP_STEPS = 48;
+        const ramp = Array.from({ length: RAMP_STEPS + 1 }, (_, i) => {
+            const b = (i / RAMP_STEPS) * 0.4;
+            return `rgb(${Math.floor(b*10)},${Math.floor(b*30)},${Math.floor(b*50)})`;
+        });
+
+        function initBackground() {
+            bgCanvas.width = window.innerWidth;
+            bgCanvas.height = window.innerHeight;
+            cols = Math.ceil(bgCanvas.width / pixelSize);
+            rows = Math.ceil(bgCanvas.height / pixelSize);
+            pixels = [];
+            for (let i = 0; i < cols * rows; i++)
+                pixels.push({ brightness: Math.random() * 0.3, speed: 0.001 + Math.random() * 0.003 });
+        }
+
+        let bgFrame = 0;
+        function animateBackground() {
+            // Half the frame rate is imperceptible here and halves the fill cost
+            if ((bgFrame++ & 1) === 0) {
+                for (let y = 0; y < rows; y++) {
+                    for (let x = 0; x < cols; x++) {
+                        const p = pixels[y * cols + x];
+                        p.brightness += p.speed * 2;
+                        if (p.brightness > 0.4) p.brightness = 0;
+                        bgCtx.fillStyle = ramp[Math.min(RAMP_STEPS, (p.brightness * RAMP_STEPS / 0.4) | 0)];
+                        bgCtx.fillRect(x * pixelSize, y * pixelSize, pixelSize, pixelSize);
+                    }
+                }
+            }
+            requestAnimationFrame(animateBackground);
+        }
+
+        // ── Three.js ──
+        const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('animationCanvas'), antialias: true, alpha: true });
+        let scene, camera, scorpion;
+        let tailSegments = [], stingerGroup;
+        let arms = [], legs = [];
+
+        function updateSize() {
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        }
+
+        function updateCamera() {
+            const w = window.innerWidth;
+            if (w < 480)      { camera.position.set(0, 1.5, 3.8); camera.fov = 55; }
+            else if (w < 768) { camera.position.set(0, 1.3, 3.2); camera.fov = 50; }
+            else              { camera.position.set(0, 1.0, 2.6); camera.fov = 45; }
+            camera.lookAt(0, 0, 0);
+            camera.updateProjectionMatrix();
+        }
+
+        // Wireframe MeshBasicMaterial ignores lights, so materials can be
+        // shared freely — one per color instead of one per mesh.
+        const matCache = new Map();
+        function mat(color) {
+            if (!matCache.has(color))
+                matCache.set(color, new THREE.MeshBasicMaterial({ color, wireframe: true }));
+            return matCache.get(color);
+        }
+
+        function tube(p0, p1, radius, color, mid) {
+            const pts = mid ? [p0, mid, p1] : [p0, p1];
+            const curve = new THREE.CatmullRomCurve3(pts);
+            return new THREE.Mesh(new THREE.TubeGeometry(curve, 8, radius, 6, false), mat(color));
+        }
+
+        function ball(r, color, x, y, z, sx=1, sy=1, sz=1) {
+            const m = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 20), mat(color));
+            m.position.set(x, y, z);
+            m.scale.set(sx, sy, sz);
+            return m;
+        }
+
+        function createScorpion() {
+            const group = new THREE.Group();
+            tailSegments = []; arms = []; legs = [];
+
+            // ── HEAD / PROSOMA FRONT ──
+            group.add(ball(0.28, colors.dark1, 0, 0.05, 1.5, 1.2, 0.7, 1.1));
+
+            // Median + lateral eyes
+            [-0.08, 0.08, -0.22, 0.22].forEach(ex => {
+                group.add(ball(0.045, colors.light, ex, 0.12, 1.6));
+            });
+
+            // Chelicerae
+            [-1, 1].forEach(side => {
+                const curve = new THREE.CatmullRomCurve3([
+                    new THREE.Vector3(side*0.12,  0.0,  1.65),
+                    new THREE.Vector3(side*0.18, -0.05, 1.85),
+                    new THREE.Vector3(side*0.22, -0.08, 2.0),
+                ]);
+                group.add(new THREE.Mesh(new THREE.TubeGeometry(curve, 6, 0.025, 5, false), mat(colors.dark1)));
+                group.add(ball(0.04, colors.light, side*0.22, -0.08, 2.0));
+            });
+
+            // ── PEDIPALP ARMS ── whole arm (arm + manus + both fingers) lives
+            // in one pivoting group at the shoulder so it can sweep and feel;
+            // the fingers keep their own pivots inside it for the pinch.
+            [-1, 1].forEach(side => {
+                const armGroup = new THREE.Group();
+                const shoulder = new THREE.Vector3(side*0.3, 0.0, 1.4);
+                armGroup.position.copy(shoulder);
+
+                // Two-segment arm with an elbow, relative to the shoulder
+                const elbow = new THREE.Vector3(side*0.42, 0.10, 0.10);
+                const wrist = new THREE.Vector3(side*0.72, 0.02, 0.32);
+                armGroup.add(tube(new THREE.Vector3(), elbow, 0.050, colors.primary));
+                armGroup.add(ball(0.060, colors.light, elbow.x, elbow.y, elbow.z));
+                armGroup.add(tube(elbow, wrist, 0.055, colors.primary));
+                armGroup.add(ball(0.065, colors.light, wrist.x, wrist.y, wrist.z));
+
+                // Manus (claw hand) — big and bulbous, with a keel ridge on top
+                armGroup.add(ball(0.17, colors.primary, side*0.92, 0.0, 0.48, 1.1, 0.75, 1.45));
+                const keel = new THREE.CatmullRomCurve3([
+                    new THREE.Vector3(side*0.80, 0.11, 0.32),
+                    new THREE.Vector3(side*0.94, 0.13, 0.48),
+                    new THREE.Vector3(side*1.00, 0.10, 0.62),
+                ]);
+                armGroup.add(new THREE.Mesh(new THREE.TubeGeometry(keel, 6, 0.014, 5, false), mat(colors.light)));
+
+                // Both fingers pivot at the front of the manus
+                const jaw = new THREE.Vector3(side*0.96, 0.0, 0.66);
+
+                // Fixed finger (top): thick base, tapering, hooked tip curving down
+                const fixedPivot = new THREE.Group();
+                fixedPivot.position.copy(jaw);
+                const fxMid = new THREE.Vector3(side*0.03, 0.09, 0.24);
+                const fxEnd = new THREE.Vector3(0, 0.03, 0.46);
+                fixedPivot.add(tube(new THREE.Vector3(), fxMid, 0.034, colors.dark1));
+                fixedPivot.add(tube(fxMid, fxEnd, 0.024, colors.dark1));
+                fixedPivot.add(tube(fxEnd, new THREE.Vector3(0, -0.01, 0.52), 0.012, colors.light)); // hook
+                // Teeth along the inner (lower) edge
+                [[side*0.02, 0.025, 0.15], [side*0.02, 0.045, 0.26], [side*0.005, 0.02, 0.36]]
+                    .forEach(([x,y,z]) => fixedPivot.add(ball(0.012, colors.light, x, y, z)));
+                armGroup.add(fixedPivot);
+
+                // Movable finger (bottom): mirror of the fixed one, hook curving up
+                const movablePivot = new THREE.Group();
+                movablePivot.position.copy(jaw);
+                const mvMid = new THREE.Vector3(side*0.03, -0.09, 0.24);
+                const mvEnd = new THREE.Vector3(0, -0.03, 0.46);
+                movablePivot.add(tube(new THREE.Vector3(), mvMid, 0.030, colors.light));
+                movablePivot.add(tube(mvMid, mvEnd, 0.021, colors.light));
+                movablePivot.add(tube(mvEnd, new THREE.Vector3(0, 0.01, 0.52), 0.012, colors.light)); // hook
+                // Teeth along the inner (upper) edge
+                [[side*0.02, -0.025, 0.15], [side*0.02, -0.045, 0.26], [side*0.005, -0.02, 0.36]]
+                    .forEach(([x,y,z]) => movablePivot.add(ball(0.012, colors.light, x, y, z)));
+                armGroup.add(movablePivot);
+
+                group.add(armGroup);
+                arms.push({ group: armGroup, fixedPivot, movablePivot, side });
+            });
+
+            // ── CARAPACE ──
+            group.add(ball(0.52, colors.primary, 0, 0.08, 0.7, 1.1, 0.6, 1.6));
+
+            // ── MESOSOMA ── segmented mid-body
+            const mesoSegs = 6;
+            for (let i = 0; i < mesoSegs; i++) {
+                const t = i / (mesoSegs - 1);
+                const w = 0.44 - t * 0.12;
+                const seg = new THREE.Mesh(
+                    new THREE.CylinderGeometry(w * 0.88, w, 0.28, 14, 2),
+                    mat(i % 2 === 0 ? colors.primary : colors.dark1)
+                );
+                const z = -0.1 - i * 0.3;
+                const y = 0.06 - i * 0.01;
+                seg.position.set(0, y, z);
+                seg.rotation.x = Math.PI * 0.5;
+                group.add(seg);
+                [-1, 1].forEach(side => {
+                    group.add(ball(w * 0.28, colors.light, side * w * 1.05, y, z));
+                });
+            }
+
+            // ── TAIL ── chained pivots — now 7 longer segments for a taller,
+            // more dramatic arc (per-segment curl is set in animate())
+            const tailSegsCount = 7;
+            let prevPivot = group;
+            let prevPos = new THREE.Vector3(0, 0.06 - mesoSegs * 0.01, -0.1 - mesoSegs * 0.3);
+
+            for (let i = 0; i < tailSegsCount; i++) {
+                const r = 0.15 - i * 0.013;
+                const pivot = new THREE.Group();
+                pivot.position.copy(prevPos);
+                const seg = new THREE.Mesh(
+                    new THREE.CylinderGeometry(r * 0.9, r, 0.34, 12, 2),
+                    mat(i % 2 === 0 ? colors.dark1 : colors.primary)
+                );
+                seg.position.set(0, 0, -0.17);
+                seg.rotation.x = Math.PI * 0.5;
+                pivot.add(seg);
+                prevPivot.add(pivot);
+                tailSegments.push(pivot);
+                prevPivot = pivot;
+                prevPos = new THREE.Vector3(0, 0, -0.34);
+            }
+
+            // Telson + stinger — bulbous vesicle and a hooked, tapering aculeus:
+            // one smooth talon curve rendered as tube segments of shrinking
+            // radius, ending in a needle aligned to the curve's own tangent
+            stingerGroup = new THREE.Group();
+            stingerGroup.position.set(0, 0, -0.34);
+            stingerGroup.add(ball(0.19, colors.primary, 0, 0, 0, 0.9, 1.0, 1.25));
+
+            // The tail's ~182° curl flips this group's frame: local −Z maps to
+            // world-forward and local +Y to world-down. So the aculeus runs
+            // along −Z and hooks toward +Y — world result: the needle sweeps
+            // forward over the head and hooks down into the strike direction.
+            const aculeus = new THREE.CatmullRomCurve3([
+                new THREE.Vector3(0, 0.02, -0.04),
+                new THREE.Vector3(0, 0.06, -0.22),
+                new THREE.Vector3(0, 0.15, -0.40),
+                new THREE.Vector3(0, 0.26, -0.52),
+                new THREE.Vector3(0, 0.40, -0.60), // the hook
+            ]);
+            const STING_STEPS = 6;
+            for (let i = 0; i < STING_STEPS; i++) {
+                const sub = new THREE.CatmullRomCurve3([
+                    aculeus.getPoint(i / STING_STEPS),
+                    aculeus.getPoint((i + 0.5) / STING_STEPS),
+                    aculeus.getPoint((i + 1) / STING_STEPS),
+                ]);
+                const r = 0.052 * (1 - i / STING_STEPS) + 0.012 * (i / STING_STEPS);
+                stingerGroup.add(new THREE.Mesh(new THREE.TubeGeometry(sub, 4, r, 5, false), mat(colors.light)));
+            }
+            const tipDir = aculeus.getTangent(1).normalize();
+            const tipLen = 0.16;
+            const needle = new THREE.Mesh(new THREE.ConeGeometry(0.014, tipLen, 6), mat(colors.light));
+            needle.position.copy(aculeus.getPoint(1)).addScaledVector(tipDir, tipLen / 2);
+            needle.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), tipDir);
+            stingerGroup.add(needle);
+            prevPivot.add(stingerGroup);
+
+            // ── LEGS ──
+            // Same architecture as the spider and fly: connected tube chains in
+            // pivoting groups, with fanAngle (from +Z, forward) increasing
+            // front-to-back so every leg keeps to its own angular sector.
+            // The front sector starts wider (61°) than the spider's because the
+            // pedipalp arms own the forward space.
+            const pairs = [
+                { attachZ: 1.08, fanAngle: Math.PI * 0.34, scale: 0.95 }, // pair 1 — forward-side
+                { attachZ: 0.80, fanAngle: Math.PI * 0.48, scale: 1.00 }, // pair 2
+                { attachZ: 0.52, fanAngle: Math.PI * 0.62, scale: 1.05 }, // pair 3
+                { attachZ: 0.24, fanAngle: Math.PI * 0.76, scale: 1.10 }, // pair 4 — sweeps back
+            ];
+
+            pairs.forEach((pair, pi) => {
+                [-1, 1].forEach(side => {
+                    const oX = side * Math.sin(pair.fanAngle);
+                    const oZ = Math.cos(pair.fanAngle);
+                    const sc = pair.scale;
+
+                    const legGroup = new THREE.Group();
+                    legGroup.position.set(side * 0.48, -0.02, pair.attachZ);
+
+                    // Cumulative joint builder: dh advances outward along the
+                    // leg's spoke, dv raises/lowers — scaled per pair.
+                    let h = 0, v = 0;
+                    const joint = (dh, dv) => {
+                        h += dh; v += dv;
+                        return new THREE.Vector3(oX * h * sc, v * sc, oZ * h * sc);
+                    };
+
+                    const root = new THREE.Vector3();
+                    const cox1 = joint(0.14, -0.02);  // coxa
+                    const fem1 = joint(0.36,  0.14);  // femur rises out
+                    const tib1 = joint(0.30, -0.36);  // tibia drops
+                    const ta1  = joint(0.08, -0.07);  // two tarsal segments
+                    const ta2  = joint(0.07, -0.05);
+
+                    legGroup.add(tube(root, cox1, 0.028, colors.dark1));
+                    legGroup.add(ball(0.034, colors.light, cox1.x, cox1.y, cox1.z)); // trochanter
+                    legGroup.add(tube(cox1, fem1, 0.024, colors.primary));
+                    legGroup.add(ball(0.038, colors.light, fem1.x, fem1.y, fem1.z)); // knee
+                    legGroup.add(tube(fem1, tib1, 0.016, colors.light));
+                    legGroup.add(tube(tib1, ta1, 0.011, colors.dark1));
+                    legGroup.add(tube(ta1,  ta2, 0.009, colors.dark1));
+
+                    // Claw pair
+                    [-1, 1].forEach(claw => {
+                        const cl = new THREE.Vector3(ta2.x + claw * 0.03, ta2.y - 0.045, ta2.z + 0.015);
+                        legGroup.add(tube(ta2, cl, 0.005, colors.light));
+                    });
+
+                    group.add(legGroup);
+
+                    // Lift axis: horizontal, perpendicular to the leg's spoke
+                    const outward = new THREE.Vector3(oX, 0, oZ).normalize();
+                    const liftAxis = new THREE.Vector3().crossVectors(outward, new THREE.Vector3(0, 1, 0)).normalize();
+
+                    // Alternating-tetrapod phasing — same arachnid gait as the spider
+                    const phase = ((pi + (side > 0 ? 0 : 1)) % 2) * Math.PI + pi * 0.35;
+
+                    legs.push({ group: legGroup, liftAxis, phase });
+                });
+            });
+
+            // ── PECTINES ── comb rows under the body
+            [-1, 1].forEach(side => {
+                for (let t = 0; t < 5; t++) {
+                    const pec = new THREE.Mesh(new THREE.TorusGeometry(0.018, 0.006, 5, 8), mat(colors.light));
+                    pec.position.set(side * (0.06 + t * 0.07), -0.12, 0.0);
+                    pec.rotation.x = Math.PI * 0.5;
+                    group.add(pec);
+                }
+            });
+
+            group.position.set(0, 0.0, -0.5);
+            group.rotation.x = 0.08;
+            group.scale.setScalar(0.7); // reduced size by 50%
+            return group;
+        }
+
+        // ── Pointer interaction: drag to spin, with inertia ──
+        let dragging = false, lastX = 0, spinVel = 0, userSpin = 0;
+
+        function onDown(x) { dragging = true; lastX = x; document.body.classList.add('dragging'); }
+        function onMove(x) {
+            if (!dragging) return;
+            spinVel = (x - lastX) * 0.006;
+            userSpin += spinVel;
+            lastX = x;
+        }
+        function onUp() { dragging = false; document.body.classList.remove('dragging'); }
+
+        window.addEventListener('pointerdown', e => onDown(e.clientX));
+        window.addEventListener('pointermove', e => onMove(e.clientX));
+        window.addEventListener('pointerup', onUp);
+        window.addEventListener('pointercancel', onUp);
+
+        function init() {
+            initBackground();
+            animateBackground();
+            updateSize();
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(colors.dark3);
+
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+            updateCamera();
+
+            scorpion = createScorpion();
+            scene.add(scorpion);
+
+            animate();
+        }
+
+        const _q = new THREE.Quaternion();
+        function animate() {
+            requestAnimationFrame(animate);
+            const t = Date.now();
+
+            if (scorpion) {
+                // Auto-rotate plus user drag with inertia
+                if (!dragging) {
+                    userSpin += spinVel;
+                    spinVel *= 0.95;
+                }
+                scorpion.rotation.y = userSpin + t * 0.0004;
+
+                // Body drift (around the raised, slightly tilted base pose)
+                scorpion.position.y = 0.0 + Math.sin(t * 0.0015) * 0.07;
+                scorpion.rotation.x = 0.08 + Math.sin(t * 0.0008) * 0.02;
+                scorpion.rotation.z = Math.sin(t * 0.0018) * 0.015;
+
+                // Tail: curled base pose with a travelling wave up the chain.
+                // Per-segment curl sums to ~3.2 rad across 7 segments, arcing
+                // the longer tail up and over into the strike pose.
+                tailSegments.forEach((seg, i) => {
+                    const base = 0.20 + i * 0.085;
+                    seg.rotation.x = base + Math.sin(t * 0.0012 + i * 0.35) * 0.05;
+                    seg.rotation.y = Math.sin(t * 0.0007 + i * 0.3) * 0.02; // faint lateral sway
+                });
+                stingerGroup.rotation.x = Math.sin(t * 0.002) * 0.08;
+
+                // Arms sweep gently; pincers SNAP — slow open, fast shut,
+                // brief hold, with the two claws offset by half a cycle
+                for (const arm of arms) {
+                    const cyc = (t * 0.00035 + (arm.side > 0 ? 0 : 0.5)) % 1;
+                    let open;
+                    if (cyc < 0.62)      open = cyc / 0.62;               // slow open
+                    else if (cyc < 0.70) open = 1 - (cyc - 0.62) / 0.08;  // snap!
+                    else                 open = 0;                        // held shut
+                    open = open * open * (3 - 2 * open);                  // ease the ends
+                    // +X rotation drops a +Z finger, −X lifts it: the bottom
+                    // (movable) finger swings DOWN to open, the top finger
+                    // lifts slightly — gaping apart instead of crossing over
+                    arm.movablePivot.rotation.x =  open * 0.55;
+                    arm.fixedPivot.rotation.x   = -open * 0.16;
+                    arm.group.rotation.y = Math.sin(t * 0.0011 + arm.side) * 0.06 * arm.side;
+                    arm.group.rotation.x = Math.sin(t * 0.0009) * 0.03;
+                }
+
+                // Idle stepping ripple across the legs (tetrapod phasing)
+                for (const leg of legs) {
+                    const lift  = Math.sin(t * 0.0035 + leg.phase) * 0.045;
+                    const swing = Math.sin(t * 0.0035 + leg.phase + Math.PI / 2) * 0.025;
+                    _q.setFromAxisAngle(leg.liftAxis, lift);
+                    leg.group.quaternion.copy(_q);
+                    leg.group.rotateY(swing);
+                }
+            }
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            updateSize(); initBackground();
+            if (camera) { camera.aspect = window.innerWidth / window.innerHeight; updateCamera(); }
+        });
+
+        window.addEventListener('load', init);
+    </script>
+</body>
+</html>

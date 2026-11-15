@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ThreeJS: Bumblebee</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #0b1220; overflow: hidden; height: 100%; }
+  #bgCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 1; }
+  #animationCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 2; cursor: grab; touch-action: none; }
+  #animationCanvas:active { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="bgCanvas"></canvas>
+<canvas id="animationCanvas"></canvas>
+
+<script>
+const bgCanvas = document.getElementById('bgCanvas');
+const bgCtx = bgCanvas.getContext('2d');
+function initBackground(){
+  bgCanvas.width = innerWidth; bgCanvas.height = innerHeight;
+  const g = bgCtx.createRadialGradient(
+    bgCanvas.width*0.5, bgCanvas.height*0.38, 0,
+    bgCanvas.width*0.5, bgCanvas.height*0.38, Math.max(bgCanvas.width, bgCanvas.height)*0.75
+  );
+  g.addColorStop(0, '#16233c');
+  g.addColorStop(0.55, '#0e1626');
+  g.addColorStop(1, '#05070d');
+  bgCtx.fillStyle = g;
+  bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+}
+
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('animationCanvas'), antialias:true, alpha:true });
+let scene, camera, bee;
+const legParts = [];
+const wingParts = [];
+const antennaParts = [];
+const abdomenSegs = [];
+
+function updateSize(){
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+}
+
+const cam = { dist: 3.23, yaw: 0.5, pitch: 0.22, targetYaw: 0.5, targetPitch: 0.22, targetDist: 3.23, autoYaw: 0 };
+function updateCamera(){
+  const w = innerWidth;
+  if (w < 480){ cam.targetDist = Math.min(Math.max(cam.targetDist, 8.5), 13); camera.fov = 58; }
+  else if (w < 768){ camera.fov = 52; }
+  else { camera.fov = 46; }
+  camera.updateProjectionMatrix();
+}
+function applyCamera(){
+  cam.yaw   += (cam.targetYaw   - cam.yaw)   * 0.08;
+  cam.pitch += (cam.targetPitch - cam.pitch) * 0.08;
+  cam.dist  += (cam.targetDist  - cam.dist)  * 0.08;
+  const total = cam.yaw + cam.autoYaw;
+  const p = Math.max(-1.35, Math.min(1.35, cam.pitch));
+  camera.position.set(
+    Math.sin(total)*Math.cos(p)*cam.dist,
+    Math.sin(p)*cam.dist + 0.35,
+    Math.cos(total)*Math.cos(p)*cam.dist
+  );
+  camera.lookAt(0, -0.02, 0.05);
+}
+
+function matte(color, opts={}){
+  return new THREE.MeshStandardMaterial(Object.assign({
+    color, roughness:0.55, metalness:0.12, side:THREE.DoubleSide
+  }, opts));
+}
+
+const iriMats = [];
+let hueShift = 0;
+function shimmer(baseHue, opts={}){
+  const { sat=0.35, light=0.72, roughness=0.15, metalness=0.05, opacity=0.4, transparent=true } = opts;
+  const m = new THREE.MeshStandardMaterial({
+    color:0xffffff, roughness, metalness, side:THREE.DoubleSide, transparent, opacity, depthWrite:false
+  });
+  m.userData = { offset: baseHue, sat, light };
+  m.color.setHSL(((baseHue%1)+1)%1, sat, light);
+  iriMats.push(m);
+  return m;
+}
+
+function fuzz(geo, amp, freq){
+  const pos = geo.attributes.position, v = new THREE.Vector3();
+  for (let i=0;i<pos.count;i++){
+    v.fromBufferAttribute(pos, i);
+    const n = (Math.sin(v.x*freq)*Math.cos(v.y*freq*1.3) + Math.sin(v.z*freq*1.7))*0.5;
+    const d = 1 + amp*n + amp*0.4*(Math.random()-0.5);
+    v.multiplyScalar(d);
+    pos.setXYZ(i, v.x, v.y, v.z);
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+}
+
+function segmentBetween(p0, p1, r0, r1, material, radialSeg=10){
+  const dir = new THREE.Vector3().subVectors(p1, p0);
+  const len = dir.length();
+  const geo = new THREE.CylinderGeometry(r1, r0, len, radialSeg, 1, false);
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.position.copy(p0).add(p1).multiplyScalar(0.5);
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.clone().normalize());
+  return mesh;
+}
+
+function scatterHairs(parent, count, radiusFn, mat, lenRange, colorJitter){
+  for (let i=0;i<count;i++){
+    const theta = Math.random()*Math.PI*2;
+    const phi = Math.acos(Math.random()*1.7 - 0.85);
+    const r = radiusFn();
+    const base = new THREE.Vector3(
+      Math.sin(phi)*Math.cos(theta)*r.x,
+      Math.cos(phi)*r.y*0.95,
+      Math.sin(phi)*Math.sin(theta)*r.z
+    ).add(r.center);
+    const len = lenRange[0] + Math.random()*(lenRange[1]-lenRange[0]);
+    const outDir = base.clone().sub(r.center).normalize();
+    const tip = base.clone().add(outDir.multiplyScalar(len));
+    const hairMat = colorJitter ? mat[Math.floor(Math.random()*mat.length)] : mat;
+    parent.add(segmentBetween(base, tip, 0.012, 0.001, hairMat, 4));
+  }
+}
+
+function makeAntenna(side){
+  const grp = new THREE.Group();
+  const mat = matte(0x120d08, { roughness:0.5, metalness:0.15 });
+  const A = new THREE.Vector3(side*0.10, 0.16, 0.10);
+  const B = new THREE.Vector3(side*0.16, 0.30, 0.34);
+  const scapeMesh = segmentBetween(new THREE.Vector3(0,0,0), A, 0.028, 0.02, mat, 8);
+  grp.add(scapeMesh);
+  const flagellum = new THREE.Group();
+  flagellum.position.copy(A);
+  grp.add(flagellum);
+  const tipMesh = segmentBetween(new THREE.Vector3(0,0,0), B.clone().sub(A), 0.018, 0.007, mat, 6);
+  flagellum.add(tipMesh);
+  const knob = new THREE.Mesh(new THREE.SphereGeometry(0.02, 8, 8), mat);
+  knob.position.copy(B.clone().sub(A));
+  flagellum.add(knob);
+  antennaParts.push({ grp, flagellum, phase: side*0.6 });
+  return grp;
+}
+
+function legHairs(parent, p0, p1, mat, count, len, side, spread=0.6){
+  for (let i=0;i<count;i++){
+    const f = (i+0.5)/count;
+    const base = new THREE.Vector3().lerpVectors(p0, p1, f);
+    const ang = Math.random()*Math.PI*2;
+    const outDir = new THREE.Vector3(Math.cos(ang)*spread*side, -0.25 - Math.random()*0.2, Math.sin(ang)*spread).normalize();
+    const l = len*(0.55 + Math.random()*0.8);
+    const tip = base.clone().add(outDir.multiplyScalar(l));
+    parent.add(segmentBetween(base, tip, 0.006, 0.001, mat, 4));
+  }
+}
+
+function makeLeg(side, cfg){
+  const s = side;
+  const chitinDark = matte(0x120c07, { roughness:0.55, metalness:0.18 });
+  const chitinMid  = matte(0x27190a, { roughness:0.6,  metalness:0.12 });
+  const hairMat    = matte(0x9a621c, { roughness:0.9,  metalness:0.02 });
+  const pollenMat  = matte(0xe0a01a, { roughness:0.7,  metalness:0.05 });
+
+  const root = new THREE.Group();
+  root.position.set(s*cfg.x, cfg.y, cfg.z);
+  root.rotation.z = s*cfg.out;
+  root.rotation.x = cfg.back || 0;
+
+  // coxa + trochanter: short thick stub anchoring the leg to the body
+  const coxaEnd = new THREE.Vector3(s*0.03, -cfg.lenCoxa, 0.01);
+  root.add(segmentBetween(new THREE.Vector3(0,0,0), coxaEnd, 0.055, 0.038, chitinDark, 10));
+  const coxaJoint = new THREE.Mesh(new THREE.SphereGeometry(0.038, 10, 8), chitinDark);
+  coxaJoint.position.copy(coxaEnd);
+  root.add(coxaJoint);
+
+  const swing = new THREE.Group();
+  swing.position.copy(coxaEnd);
+  root.add(swing);
+
+  // femur - thickest, hairiest segment
+  const A = new THREE.Vector3(s*0.06, -cfg.len1, -0.02);
+  swing.add(segmentBetween(new THREE.Vector3(0,0,0), A, 0.044, 0.026, chitinMid, 10));
+  const femurJoint = new THREE.Mesh(new THREE.SphereGeometry(0.026, 8, 8), chitinMid);
+  femurJoint.position.copy(A);
+  swing.add(femurJoint);
+  legHairs(swing, new THREE.Vector3(0,0,0), A, hairMat, 9, 0.05, s, 0.7);
+
+  const mid = new THREE.Group();
+  mid.position.copy(A);
+  mid.rotation.x = cfg.baseMid;
+  swing.add(mid);
+
+  // tibia
+  const B = new THREE.Vector3(s*0.05, -cfg.len2, 0.03);
+  mid.add(segmentBetween(new THREE.Vector3(0,0,0), B, 0.026, 0.015, chitinDark, 10));
+  legHairs(mid, new THREE.Vector3(0,0,0), B, hairMat, 11, 0.045, s, 0.65);
+
+  if (cfg.isHind){
+    // pollen basket: a smooth, sparsely-haired concave patch on the outer hind tibia
+    const basket = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 10), pollenMat);
+    basket.scale.set(0.045, cfg.len2*0.5, 0.02);
+    basket.position.set(s*0.028, -cfg.len2*0.52, 0.012);
+    mid.add(basket);
+  }
+
+  const tarsus = new THREE.Group();
+  tarsus.position.copy(B);
+  tarsus.rotation.x = -0.3;
+  mid.add(tarsus);
+
+  // tarsus: three tapering tarsomeres instead of one stub
+  let prev = new THREE.Vector3(0,0,0);
+  let last = prev;
+  const nTar = 3;
+  for (let i=0;i<nTar;i++){
+    const segLen = cfg.len3 * (i===0 ? 0.46 : 0.27);
+    const next = new THREE.Vector3(s*0.006, -segLen, 0.012*i);
+    const r0 = 0.015 - i*0.003, r1 = 0.011 - i*0.003;
+    tarsus.add(segmentBetween(prev, next, r0, r1, i%2 ? chitinDark : chitinMid, 8));
+    prev = next.clone();
+  }
+  const C = prev;
+  legHairs(tarsus, new THREE.Vector3(0,0,0), C, hairMat, 4, 0.02, s, 0.5);
+
+  for (let c=-1; c<=1; c+=2){
+    const dir = new THREE.Vector3(c*0.35*s, -1, 0.15).normalize();
+    const tip = C.clone().add(dir.multiplyScalar(0.05));
+    tarsus.add(segmentBetween(C, tip, 0.008, 0.001, chitinDark, 5));
+  }
+
+  legParts.push({ swing, mid, tarsus, phase:cfg.phase, swingAmp:cfg.swingAmp, baseMid:cfg.baseMid });
+  return root;
+}
+
+function makeWingShape(len, wide){
+  // Built with length running along local +X (outward) and chord along local Y,
+  // so the wing spans sideways once flattened, rather than sticking up.
+  const shape = new THREE.Shape();
+  shape.moveTo(0, 0);
+  shape.bezierCurveTo(len*0.18, wide*0.15, len*0.30, wide*0.95, len*0.62, wide*0.88);
+  shape.bezierCurveTo(len*0.92, wide*0.80, len*1.02, wide*0.30, len*0.98, 0);
+  shape.bezierCurveTo(len*0.70, -wide*0.12, len*0.28, -wide*0.05, 0, 0);
+  return shape;
+}
+
+function makeWing(side, cfg){
+  const grp = new THREE.Group();
+  // Hinge sits at the body; base pose splays the wing flat and outward,
+  // matching a resting/pinned bumblebee rather than an upright fairy-wing.
+  // The wing itself is always built the same way (as if for the right side);
+  // the left copy is a true mirror (scale.x = -1) so both sides share the
+  // exact same rotation values and stay in symmetric sync.
+  grp.position.set(side*cfg.x, cfg.y, cfg.z);
+  grp.scale.x = side;
+  grp.rotation.y = -0.10;
+  grp.rotation.z = 0.05;
+
+  const flat = new THREE.Group();
+  flat.rotation.x = -Math.PI/2; // lays the XY shape down into the horizontal plane
+  grp.add(flat);
+
+  const mat = shimmer(0.55, { opacity:0.38, light:0.78, sat:0.3 });
+  const shape = makeWingShape(cfg.len, cfg.wide);
+  const geo = new THREE.ShapeGeometry(shape, 8);
+  const mesh = new THREE.Mesh(geo, mat);
+  flat.add(mesh);
+
+  const veinMat = matte(0x2a2418, { roughness:0.4, metalness:0.1 });
+  const nVeins = 4;
+  for (let i=0;i<nVeins;i++){
+    const f = (i+1)/(nVeins+1);
+    const p0 = new THREE.Vector3(0,0,0);
+    const p1 = new THREE.Vector3(cfg.len*(0.32+f*0.62), cfg.wide*(f*0.55-0.06), 0);
+    flat.add(segmentBetween(p0, p1, 0.004, 0.0015, veinMat, 4));
+  }
+
+  wingParts.push({ grp, flat, baseZ: grp.rotation.z, phase: cfg.phase, isFront: cfg.front });
+  return grp;
+}
+
+function createBee(){
+  const g = new THREE.Group();
+  const body = new THREE.Group();
+  g.add(body);
+
+  const zHead = 1.35, zTail = -1.55, span = zHead - zTail;
+  const radiusAt = u => {
+    const head   = 0.20*Math.exp(-Math.pow((u-0.02)/0.10, 2));
+    const thorax = 0.40*Math.exp(-Math.pow((u-0.22)/0.16, 2));
+    const abdomen= 0.36*Math.exp(-Math.pow((u-0.56)/0.24, 2));
+    const taper  = Math.max(0.02, 1 - Math.pow(Math.max(0, (u-0.72)/0.30), 1.6));
+    return Math.max(0.04, (head*0.9 + thorax + abdomen*taper));
+  };
+
+  const stripeColor = (u) => {
+    if (u < 0.10) return 0x140f0a;
+    if (u < 0.38) return 0xf4b400;
+    if (u < 0.47) return 0x140f0a;
+    if (u < 0.60) return 0xf4b400;
+    if (u < 0.68) return 0x140f0a;
+    if (u < 0.82) return 0xf4b400;
+    if (u < 0.90) return 0x140f0a;
+    return 0xf3ede0;
+  };
+
+  const N = 11;
+  for (let i=0;i<N;i++){
+    const u = i/(N-1);
+    const z = zHead - u*span;
+    const rr = radiusAt(u);
+    const isFuzzy = u < 0.40;
+    const col = isFuzzy ? 0xe8a400 : stripeColor(u);
+    const mat = matte(col, { roughness: isFuzzy?0.9:0.55, metalness: isFuzzy?0.01:0.1 });
+    const geo = new THREE.SphereGeometry(1, 24, 20);
+    if (isFuzzy) fuzz(geo, 0.10, 5); else fuzz(geo, 0.025, 6);
+    const wide = rr*1.02, tall = rr*0.9, depth = Math.max(0.09, rr*0.95);
+    const seg = new THREE.Mesh(geo, mat);
+    seg.scale.set(wide, tall, depth);
+    seg.position.set(0, -0.015*(1-u)*10*0.02, z);
+    body.add(seg);
+    abdomenSegs.push({ mesh:seg, base:new THREE.Vector3(wide, tall, depth), u, isFuzzy });
+  }
+
+  const thoraxFuzzMats = [
+    matte(0x1a1208, { roughness:0.9, metalness:0.02 }),
+    matte(0xe8a400, { roughness:0.9, metalness:0.02 })
+  ];
+  scatterHairs(body, 420, () => ({
+    x:0.46, y:0.38, z:0.46, center:new THREE.Vector3(0, 0.02, zHead - 0.22*span)
+  }), thoraxFuzzMats, [0.035, 0.11], true);
+  scatterHairs(body, 160, () => ({
+    x:0.32, y:0.26, z:0.32, center:new THREE.Vector3(0, 0.0, zHead - 0.06*span)
+  }), thoraxFuzzMats[0], [0.025, 0.06], false);
+  scatterHairs(body, 90, () => ({
+    x:0.40, y:0.30, z:0.40, center:new THREE.Vector3(0, 0.02, zHead - 0.36*span)
+  }), thoraxFuzzMats, [0.03, 0.075], true);
+
+  for (let bu=0.42; bu<0.98; bu+=0.09){
+    const rr = radiusAt(bu);
+    const bandMat = matte(stripeColor(bu), { roughness:0.92, metalness:0.01 });
+    scatterHairs(body, 22, () => ({
+      x: rr*1.0, y: rr*0.9, z: rr*0.9, center: new THREE.Vector3(0, 0.0, zHead - bu*span)
+    }), bandMat, [0.012, 0.03], false);
+  }
+
+  const zHeadFace = zHead + 0.02;
+  const headGroup = new THREE.Group();
+  headGroup.position.set(0, 0, zHeadFace);
+  body.add(headGroup);
+
+  const eyeMat = matte(0x0c0a12, { roughness:0.2, metalness:0.4 });
+  [-1,1].forEach(sx=>{
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 14), eyeMat);
+    eye.scale.set(0.09, 0.13, 0.16);
+    eye.position.set(sx*0.145, 0.03, -0.02);
+    eye.rotation.y = sx*0.35;
+    headGroup.add(eye);
+    const hi = new THREE.Mesh(new THREE.SphereGeometry(0.02, 8, 8), matte(0x9fa6b0, { roughness:0.15 }));
+    hi.position.set(sx*0.19, 0.08, 0.06);
+    headGroup.add(hi);
+  });
+
+  const ocelliMat = matte(0x2a1c08, { roughness:0.4 });
+  for (let i=-1;i<=1;i++){
+    const o = new THREE.Mesh(new THREE.SphereGeometry(0.012, 6, 6), ocelliMat);
+    o.position.set(i*0.03, 0.16, 0.02);
+    headGroup.add(o);
+  }
+
+  const mandMat = matte(0x1c130a, { roughness:0.4, metalness:0.15 });
+  [-1,1].forEach(sx=>{
+    const mand = new THREE.Mesh(new THREE.ConeGeometry(0.025, 0.06, 8), mandMat);
+    mand.position.set(sx*0.045, -0.10, 0.13);
+    mand.rotation.x = Math.PI/2 - 0.4;
+    mand.rotation.z = sx*0.3;
+    headGroup.add(mand);
+  });
+  const proboscis = segmentBetween(new THREE.Vector3(0,-0.08,0.12), new THREE.Vector3(0,-0.20,0.20), 0.018, 0.006, mandMat, 6);
+  headGroup.add(proboscis);
+
+  headGroup.add(makeAntenna(-1));
+  headGroup.add(makeAntenna(1));
+
+  const stingMat = matte(0x0e0a06, { roughness:0.3, metalness:0.3 });
+  const sting = segmentBetween(new THREE.Vector3(0,0,zTail+0.02), new THREE.Vector3(0,-0.02,zTail-0.16), 0.018, 0.001, stingMat, 6);
+  body.add(sting);
+
+  const wingBaseY = 0.30, wingBaseZ = zHead - 0.20*span;
+  [
+    { front:true,  x:0.10, y:wingBaseY, z:wingBaseZ,       len:1.55, wide:0.62, phase:0 },
+    { front:false, x:0.16, y:wingBaseY-0.02, z:wingBaseZ-0.12, len:1.25, wide:0.50, phase:0.15 }
+  ].forEach(w=>{
+    body.add(makeWing(-1, w));
+    body.add(makeWing( 1, w));
+  });
+
+  const legDefs = [
+    { u:0.24, out:0.75, back:-0.15, lenCoxa:0.07, len1:0.30, len2:0.26, len3:0.14, swingAmp:0.35, baseMid:0.35, isHind:false },
+    { u:0.34, out:0.80, back:0.05,  lenCoxa:0.08, len1:0.32, len2:0.27, len3:0.15, swingAmp:0.30, baseMid:0.30, isHind:false },
+    { u:0.42, out:0.70, back:0.35,  lenCoxa:0.09, len1:0.34, len2:0.32, len3:0.15, swingAmp:0.25, baseMid:0.30, isHind:true  }
+  ];
+  legDefs.forEach((d,p)=>{
+    const rr = radiusAt(d.u);
+    const cfg = Object.assign({}, d, {
+      x: rr*0.7,
+      y: -rr*0.35,
+      z: zHead - d.u*span
+    });
+    g.add(makeLeg( 1, Object.assign({}, cfg, { phase: p*1.4 })));
+    g.add(makeLeg(-1, Object.assign({}, cfg, { phase: p*1.4 + Math.PI })));
+  });
+
+  g.scale.setScalar(1.1);
+  return g;
+}
+
+function init(){
+  initBackground(); updateSize();
+
+  scene = new THREE.Scene();
+  scene.background = null;
+  scene.fog = new THREE.FogExp2(0x0b1220, 0.024);
+
+  camera = new THREE.PerspectiveCamera(46, innerWidth/innerHeight, 0.1, 1000);
+  updateCamera();
+
+  bee = createBee();
+  scene.add(bee);
+
+  scene.add(new THREE.HemisphereLight(0xfff2cf, 0x101830, 0.7));
+  const key  = new THREE.DirectionalLight(0xfff2d0, 1.4); key.position.set(4,7,6); scene.add(key);
+  const rim  = new THREE.PointLight(0xffd35c, 1.1, 60); rim.position.set(-6,3,-2); scene.add(rim);
+  const rim2 = new THREE.PointLight(0x6fa8ff, 0.9, 60); rim2.position.set(6,-1,-4); scene.add(rim2);
+  const under= new THREE.PointLight(0xffaa33, 0.5, 40); under.position.set(0,-5,3); scene.add(under);
+  const glint= new THREE.PointLight(0xffffff, 0.9, 40); glint.position.set(2,4,8); scene.add(glint);
+
+  addPointerControls();
+  animate();
+}
+
+let flightSpeed = 0.6, flightTarget = 0.6, nextChange = 3;
+function animate(){
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const t = now * 0.001;
+
+  hueShift = (t * 0.03) % 1;
+  for (let i=0;i<iriMats.length;i++){
+    const m = iriMats[i];
+    m.color.setHSL((hueShift + m.userData.offset) % 1, m.userData.sat, m.userData.light);
+  }
+
+  if (t > nextChange){
+    flightTarget = Math.random() < 0.25 ? 0.15 : 0.7 + Math.random()*0.8;
+    nextChange = t + 2.5 + Math.random()*3.0;
+  }
+  flightSpeed += (flightTarget - flightSpeed) * 0.02;
+
+  const wingFreq = 24 + flightSpeed*14;
+  const wingAmp = 0.06 + flightSpeed*0.30;
+  wingParts.forEach(W=>{
+    const flap = Math.sin(t*wingFreq + W.phase);
+    W.grp.rotation.z = W.baseZ + flap * wingAmp * (W.isFront ? 1 : 0.8);
+    W.flat.rotation.y = flap * 0.08;
+  });
+
+  antennaParts.forEach((A,i)=>{
+    A.flagellum.rotation.x = Math.sin(t*2.2 + A.phase)*0.18;
+    A.flagellum.rotation.y = Math.cos(t*1.7 + A.phase)*0.12;
+  });
+
+  const tuck = 1 - Math.min(1, flightSpeed/1.2);
+  legParts.forEach(L=>{
+    const ph = t*3.0 + L.phase;
+    const dangle = Math.sin(ph)*0.05*flightSpeed;
+    L.swing.rotation.x = L.swingAmp*(0.15 + tuck*0.85) + dangle;
+    L.mid.rotation.x = L.baseMid + tuck*0.4 + Math.sin(ph*0.7)*0.05;
+  });
+
+  for (let i=0;i<abdomenSegs.length;i++){
+    const sd = abdomenSegs[i];
+    const pulse = 1 + Math.sin(t*3.0 - sd.u*4.0) * (sd.isFuzzy ? 0.01 : 0.025);
+    sd.mesh.scale.set(sd.base.x, sd.base.y*pulse, sd.base.z*(2-pulse));
+  }
+
+  const hover = Math.sin(t*wingFreq*0.5) * 0.015 * flightSpeed;
+  bee.position.y = -0.05 + Math.sin(t*1.3)*0.08 + hover;
+  bee.position.x = Math.sin(t*0.6)*0.12*flightSpeed;
+  bee.rotation.z = Math.sin(t*0.6)*0.08*flightSpeed;
+  bee.rotation.x = 0.05 + Math.sin(t*0.9)*0.03;
+  bee.rotation.y = Math.sin(t*0.35)*0.15*flightSpeed;
+
+  if (!dragging) cam.autoYaw += 0.0012 + flightSpeed*0.0003;
+  applyCamera();
+
+  renderer.render(scene, camera);
+}
+
+let dragging=false, lastX=0, lastY=0, pinchD=0;
+function addPointerControls(){
+  const c = renderer.domElement;
+  c.addEventListener('pointerdown', e=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; c.setPointerCapture(e.pointerId); });
+  c.addEventListener('pointermove', e=>{
+    if(!dragging) return;
+    cam.targetYaw   += (e.clientX-lastX)*0.006;
+    cam.targetPitch += (e.clientY-lastY)*0.006;
+    lastX=e.clientX; lastY=e.clientY;
+  });
+  const stop=()=>dragging=false;
+  c.addEventListener('pointerup', stop);
+  c.addEventListener('pointercancel', stop);
+  c.addEventListener('pointerleave', stop);
+  c.addEventListener('wheel', e=>{ e.preventDefault(); cam.targetDist = Math.max(4, Math.min(15, cam.targetDist + e.deltaY*0.01)); }, {passive:false});
+  c.addEventListener('touchmove', e=>{
+    if(e.touches.length===2){
+      const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY;
+      const d=Math.hypot(dx,dy);
+      if(pinchD) cam.targetDist = Math.max(4, Math.min(15, cam.targetDist + (pinchD-d)*0.02));
+      pinchD=d;
+    }
+  }, {passive:true});
+  c.addEventListener('touchend', ()=>pinchD=0);
+}
+
+addEventListener('resize', ()=>{
+  updateSize();
+  initBackground();
+  if(camera){ camera.aspect = innerWidth/innerHeight; updateCamera(); }
+});
+addEventListener('load', init);
+</script>
+</body>
+</html>
